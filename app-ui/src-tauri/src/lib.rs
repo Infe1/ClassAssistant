@@ -99,7 +99,7 @@ fn read_backend_port(backend_dir: &Path) -> u16 {
                 None
             }
         })
-        .unwrap_or(8765)
+        .unwrap_or(8766)
 }
 
 #[cfg(all(not(debug_assertions), target_os = "windows"))]
@@ -120,9 +120,9 @@ fn wait_for_backend_port(port: u16, timeout: Duration) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn spawn_hidden_backend(backend_dir: &Path) -> Result<Child, String> {
-    let backend_exe = backend_dir.join("class-assistant-backend.exe");
+    let backend_exe = backend_dir.join("class-fox-lite-backend.exe");
     if !backend_exe.exists() {
-        return Err("未找到 backend/class-assistant-backend.exe".to_string());
+        return Err("未找到 backend/class-fox-lite-backend.exe".to_string());
     }
 
     let mut command = Command::new(backend_exe);
@@ -230,12 +230,12 @@ fn cleanup_backend_processes(graceful_stop: bool) {
     }
 
     if graceful_stop {
-        run_hidden_powershell("try { Invoke-WebRequest -Uri 'http://127.0.0.1:8765/api/stop_monitor' -Method Post -UseBasicParsing -TimeoutSec 2 | Out-Null } catch {}");
+        run_hidden_powershell("try { Invoke-WebRequest -Uri 'http://127.0.0.1:8766/api/stop_monitor' -Method Post -UseBasicParsing -TimeoutSec 2 | Out-Null } catch {}");
     }
 
-    run_hidden_command("taskkill", &["/IM", "class-assistant-backend.exe", "/F"]);
+    run_hidden_command("taskkill", &["/IM", "class-fox-lite-backend.exe", "/F"]);
     run_hidden_command("taskkill", &["/FI", "WINDOWTITLE eq ClassAssistant-Backend", "/F"]);
-    run_hidden_powershell("$portPids = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach ($portPid in $portPids) { Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue }");
+    run_hidden_powershell("$portPids = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach ($portPid in $portPids) { Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue }");
 }
 
 #[cfg(not(target_os = "windows"))]

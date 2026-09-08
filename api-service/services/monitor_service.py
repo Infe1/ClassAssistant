@@ -19,7 +19,7 @@ from fastapi import WebSocket
 from dotenv import load_dotenv
 
 from config import DATA_DIR
-from services.asr_service import BrowserSpeechASR, create_asr, BaseASR, LocalASR, WindowsBuiltInASR
+from services.asr_service import BrowserSpeechASR, create_asr, BaseASR
 from services.llm_service import LLMService
 from services.transcript_service import TranscriptService
 
@@ -77,67 +77,6 @@ class MonitorService:
 
         # ASR 增量文本追踪
         self._last_asr_text: str = ""
-
-    def _is_sentence_closed(self, text: str) -> bool:
-        return bool(re.search(r"[。！？!?；;……]$", text.strip()))
-
-    def _seconds_between_timestamps(self, earlier: str, later: str) -> float | None:
-        try:
-            start = datetime.strptime(earlier, "%H:%M:%S")
-            end = datetime.strptime(later, "%H:%M:%S")
-        except ValueError:
-            return None
-
-        delta = (end - start).total_seconds()
-        if delta < 0:
-            delta += 24 * 60 * 60
-        return delta
-
-    def _replace_last_entry_locked(self, timestamp: str, text: str):
-        if self._recent_entries:
-            self._recent_entries[-1] = (timestamp, text)
-        if self._summary_source_entries:
-            self._summary_source_entries[-1] = (timestamp, text)
-
-        dedupe_text = self._normalize_for_dedupe(text)
-        if dedupe_text:
-            if self._recent_normalized_entries:
-                self._recent_normalized_entries[-1] = dedupe_text
-            else:
-                self._recent_normalized_entries.append(dedupe_text)
-
-    def _append_or_merge_local_entry_locked(self, timestamp: str, text: str) -> tuple[bool, str]:
-        cleaned = self._normalize_text(text)
-        if not cleaned or not self._is_meaningful_text(cleaned):
-            return False, ""
-
-        if not self._summary_source_entries:
-            return self._append_entry_locked(timestamp, cleaned), cleaned
-
-        last_timestamp, last_text = self._summary_source_entries[-1]
-        previous = self._normalize_text(last_text)
-        if not previous:
-            return self._append_entry_locked(timestamp, cleaned), cleaned
-
-        gap_seconds = self._seconds_between_timestamps(last_timestamp, timestamp)
-        can_try_merge = gap_seconds is not None and gap_seconds <= 3
-        merged_text = ""
-
-        if can_try_merge:
-            if cleaned.startswith(previous) and len(cleaned) > len(previous):
-                merged_text = cleaned
-            elif (
-                len(previous) <= 4
-                or not self._is_sentence_closed(previous)
-            ) and not self._is_near_duplicate_locked(cleaned):
-                merged_text = f"{previous}{cleaned}".strip()
-
-        if merged_text and self._is_meaningful_text(merged_text):
-            self._replace_last_entry_locked(timestamp, merged_text)
-            return True, merged_text
-
-        appended = self._append_entry_locked(timestamp, cleaned)
-        return appended, cleaned if appended else ""
 
     def get_all_keywords(self) -> List[str]:
         """获取所有关键词（内置 + 自定义）"""
@@ -251,9 +190,6 @@ class MonitorService:
 
         self._asr = create_asr(on_text=self._on_asr_text, asr_model=self._asr_model or None)
         logger.info("[Monitor] ASR instance created: %s", type(self._asr).__name__)
-
-        if isinstance(self._asr, (LocalASR, WindowsBuiltInASR)):
-            self._asr.on_text = self._on_local_asr_text
 
         try:
             self._asr.start()
@@ -507,46 +443,13 @@ class MonitorService:
             self._flush_transcript_file()
             self._schedule_summary_locked()
 
-    def _on_local_asr_text(self, text: str, is_final: bool):
-        """
-        本地 ASR 识别回调 - 每识别一句话就追加一行到转录文件。
-        不使用流式覆盖逻辑，因为本地 ASR 是分段式识别。
-        """
-        if not self.is_monitoring or self.is_paused or not text.strip():
-            return
-
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        with self._state_lock:
-            appended, alert_text = self._append_or_merge_local_entry_locked(timestamp, text)
-            if appended:
-                self._flush_transcript_file()
-                self._schedule_summary_locked()
-
-        if not appended:
-            return
-
-        alerts = self._check_alerts(alert_text)
-        level = "danger" if alerts["danger"] else "warning"
-        matched = alerts[level]
-        if matched and self._loop:
-            alert = {
-                "type": "keyword_alert",
-                "level": level,
-                "keywords": matched,
-                "text": alert_text,
-                "timestamp": timestamp,
-            }
-            asyncio.run_coroutine_threadsafe(
-                self._broadcast_alert(alert), self._loop
-            )
-
     def _on_asr_text(self, text: str, is_final: bool):
         """
-        ASR 识别回调 (可能从非主线程调用) —— 用于线上流式 ASR。
+        ASR 识别回调 (可能从非主线程调用)。
 
-        仅把最终稳定的句子写入转录文件。
-        流式修正中的 partial 文本只暂存在内存中，停止监控时再兜底写入一次。
+        is_final=True: 去重后按句写入转录文件，并做关键词检测。
+        is_final=False: 只更新内存中的 partial 行，同时通过 WebSocket
+                        广播 transcript_partial 消息，驱动前端实时字幕。
         """
         if not self.is_monitoring or self.is_paused or not text.strip():
             return
@@ -557,6 +460,7 @@ class MonitorService:
         matched: List[str] = []
         level = ""
         alert_text = ""
+        partial_text = ""
 
         with self._state_lock:
             cleaned = self._normalize_text(text)
@@ -568,6 +472,7 @@ class MonitorService:
                 appended_any = self._append_entry_locked(timestamp, cleaned)
             elif self._is_meaningful_text(cleaned) and not self._is_near_duplicate_locked(cleaned):
                 self._partial_line = (timestamp, cleaned)
+                partial_text = cleaned
 
             if appended_any:
                 self._flush_transcript_file()
@@ -594,6 +499,27 @@ class MonitorService:
             asyncio.run_coroutine_threadsafe(
                 self._broadcast_alert(alert), self._loop
             )
+
+        if self._loop:
+            # 实时字幕：partial 直接推送；final 落盘后清空前端正在说的那行
+            if partial_text:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_alert({
+                        "type": "transcript_partial",
+                        "text": partial_text,
+                        "timestamp": timestamp,
+                    }),
+                    self._loop,
+                )
+            elif appended_any:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_alert({
+                        "type": "transcript_partial",
+                        "text": "",
+                        "timestamp": timestamp,
+                    }),
+                    self._loop,
+                )
 
     def ingest_external_text(self, text: str, is_final: bool = True):
         """由前端或其他外部输入注入 ASR 文本。"""

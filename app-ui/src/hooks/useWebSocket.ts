@@ -15,12 +15,20 @@ export interface AlertMessage {
   timestamp: string;
 }
 
-const WS_URL = "ws://127.0.0.1:8765/api/ws/alerts";
+/** 实时字幕 partial 消息类型 */
+export interface PartialMessage {
+  type: "transcript_partial";
+  text: string;
+  timestamp: string;
+}
+
+const WS_URL = "ws://127.0.0.1:8766/api/ws/alerts";
 
 export function useWebSocket() {
   const [isConnected, setIsConnected] = useState(false);
   const [lastAlert, setLastAlert] = useState<AlertMessage | null>(null);
   const [alertActive, setAlertActive] = useState(false);
+  const [livePartial, setLivePartial] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const shouldReconnectRef = useRef(false);
@@ -46,11 +54,14 @@ export function useWebSocket() {
 
     ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data) as AlertMessage;
+        const data = JSON.parse(event.data) as AlertMessage | PartialMessage;
         if (data.type === "keyword_alert") {
           console.log("[WS] 收到点名警报:", data);
           setLastAlert(data);
           setAlertActive(true);
+        } else if (data.type === "transcript_partial") {
+          // partial 为空表示这句话已落盘，清掉正在说的那一行
+          setLivePartial(data.text || "");
         }
       } catch {
         // pong 或其他非 JSON 消息忽略
@@ -99,6 +110,7 @@ export function useWebSocket() {
     isConnected,
     lastAlert,
     alertActive,
+    livePartial,
     connect,
     disconnect,
     dismissAlert,

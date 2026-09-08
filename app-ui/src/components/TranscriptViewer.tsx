@@ -4,11 +4,14 @@ import { getTranscriptSnapshot } from "../services/api";
 interface TranscriptViewerProps {
   title?: string;
   pollIntervalMs?: number;
+  /** 实时字幕：正在说但还没落盘的那句（空串表示无） */
+  livePartial?: string;
 }
 
 export default function TranscriptViewer({
   title = "课堂转录记录",
   pollIntervalMs = 5000,
+  livePartial = "",
 }: TranscriptViewerProps) {
   const [content, setContent] = useState("");
   const [mtime, setMtime] = useState<number | null>(null);
@@ -50,7 +53,7 @@ export default function TranscriptViewer({
   useEffect(() => {
     if (!autoFollow || !scrollRef.current) return;
     scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [content, autoFollow]);
+  }, [content, autoFollow, livePartial]);
 
   const summaryText = useMemo(() => {
     if (!content.trim()) {
@@ -89,6 +92,12 @@ export default function TranscriptViewer({
         className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/10 bg-black/20 p-2 text-[11px] leading-5 text-white/78"
       >
         <pre className="whitespace-pre-wrap break-words font-mono">{content || "（等待课堂转录中...）"}</pre>
+        {livePartial && (
+          <div className="mt-1 flex items-start gap-1.5 rounded-lg border border-cyan-400/25 bg-cyan-500/10 px-2 py-1">
+            <span className="mt-[2px] inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-cyan-300" />
+            <span className="break-words font-mono text-cyan-100/85">{livePartial}</span>
+          </div>
+        )}
       </div>
     </div>
   );

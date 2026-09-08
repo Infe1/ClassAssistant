@@ -65,7 +65,7 @@ function MainApp() {
   const activeBrowserAsrLangRef = useRef("zh-CN");
 
   // WebSocket 连接
-  const { lastAlert, alertActive, connect, disconnect, dismissAlert } =
+  const { lastAlert, alertActive, livePartial, connect, disconnect, dismissAlert } =
     useWebSocket();
 
   useEffect(() => {
@@ -336,7 +336,11 @@ function MainApp() {
             <div className={`grid h-full min-h-0 gap-2 ${aiExpanded && transcriptExpanded ? "grid-cols-[38%_62%]" : "grid-cols-1"}`}>
               {transcriptExpanded && (
                 <div className="min-h-0">
-                  <TranscriptViewer title="课堂字幕" pollIntervalMs={5000} />
+                  <TranscriptViewer
+                    title="课堂字幕"
+                    pollIntervalMs={5000}
+                    livePartial={livePartial}
+                  />
                 </div>
               )}
 

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("WinAsr")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+6743be8ee86cc8b5982cc6dec6e54a5c20bf4c93")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+ae171113c2865dff5e9b0ef2017667e73f262a46")]
 [assembly: System.Reflection.AssemblyProductAttribute("WinAsr")]
 [assembly: System.Reflection.AssemblyTitleAttribute("WinAsr")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

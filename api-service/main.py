@@ -19,9 +19,9 @@ load_dotenv(_dotenv_path)
 
 # 创建 FastAPI 应用实例
 app = FastAPI(
-    title="上课摸鱼搭子 - 后端服务",
-    description="大学课堂辅助工具的后端 API 服务",
-    version="1.0.1"
+    title="课狐 ClassFox Lite - 后端服务",
+    description="大学课堂辅助工具的后端 API 服务（Slim：webspeech + sherpa-onnx）",
+    version="1.3.0-slim"
 )
 
 # 配置 CORS，允许 Tauri 前端访问

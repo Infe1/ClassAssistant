@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for ClassAssistant Backend
-Bundles FastAPI + all service modules into a single directory
+PyInstaller spec for ClassFox Lite Backend (Slim)
+Bundles FastAPI + webspeech/sherpa-onnx services into a single directory
 """
 
 import os
@@ -59,17 +59,22 @@ a = Analysis(
         'docx',
         'openai',
         'dotenv',
-        'websocket',
         'gzip',
         'aiofiles',
         'httptools',
         'websockets',
-        'speech_recognition',
+        'sherpa_onnx',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'speech_recognition',
+        'winsdk',
+        'dashscope',
+        'websocket',
+        'numpy',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -83,7 +88,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='class-assistant-backend',
+    name='class-fox-lite-backend',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -104,5 +109,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='class-assistant-backend',
+    name='class-fox-lite-backend',
 )

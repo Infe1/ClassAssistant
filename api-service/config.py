@@ -17,6 +17,7 @@ else:
 
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CITE_DIR = os.path.join(DATA_DIR, "cite")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(os.path.join(DATA_DIR, "summaries"), exist_ok=True)
 os.makedirs(CITE_DIR, exist_ok=True)

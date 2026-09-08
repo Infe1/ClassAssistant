@@ -1,30 +1,24 @@
 """
-ASR 语音识别服务
-================
-支持五种模式：
-    - local:     免费语音识别（Google Speech API，无需密钥，需联网）
-    - windows:   旧版 Python WinRT 实现，保留兼容，不建议继续使用
-    - winasr:    基于 C# + WinRT 原生 API 的桌面控制台桥接实现
+ASR 语音识别服务（Slim 版）
+==========================
+只保留两条识别链路：
+    - webspeech: 前端 WebView2 / 浏览器 Web Speech 识别（微软在线服务，免 key）
+                 本模块仅提供占位实现，真实文本由前端经 /ingest_asr_text 注入
+    - sherpa:    本地流式识别 sherpa-onnx（streaming Zipformer，纯 CPU 推理，免联网）
     - mock:      空实现，用于开发测试
-    - dashscope: 阿里云百炼 Fun-ASR 实时语音识别
-    - seed-asr:  字节跳动 Seed-ASR 大模型语音识别
 """
 
-import gzip
-import importlib.util
-import json
 import logging
 import os
-import struct
 import threading
-import uuid
-import sys
+import time
 from pathlib import Path
-from json import JSONDecodeError
 from typing import Callable, Optional
 
 import pyaudio
 from dotenv import load_dotenv
+
+from config import MODELS_DIR
 
 load_dotenv()
 
@@ -71,797 +65,6 @@ class MockASR(BaseASR):
 
 
 # =====================================================================
-# 本地免费 ASR 实现（Google Speech API，无需密钥）
-# =====================================================================
-
-class LocalASR(BaseASR):
-    """
-    本地免费 ASR - 使用 SpeechRecognition + Google 免费语音识别 API
-    无需任何 API 密钥，需要联网。
-    以分段方式识别：录音至静音 → 发送识别 → 返回结果。
-    """
-
-    def __init__(self, on_text: Callable[[str, bool], None]):
-        super().__init__(on_text)
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-    def start(self):
-        self._running = True
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info("[LocalASR] started")
-
-    def _run(self):
-        """工作线程：持续监听麦克风，分段识别"""
-        import speech_recognition as sr
-
-        recognizer = sr.Recognizer()
-        # 降低能量阈值 & 加快停顿判定，提升响应速度
-        recognizer.energy_threshold = 220
-        recognizer.dynamic_energy_threshold = True
-        recognizer.dynamic_energy_adjustment_damping = 0.12
-        recognizer.dynamic_energy_adjustment_ratio = 1.4
-        recognizer.pause_threshold = 0.9
-        recognizer.phrase_threshold = 0.35
-        recognizer.non_speaking_duration = 0.45
-
-        mic = sr.Microphone(sample_rate=SAMPLE_RATE)
-
-        try:
-            with mic as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                logger.info("[LocalASR] ambient noise adjusted, listening...")
-
-                while not self._stop_event.is_set():
-                    try:
-                        audio = recognizer.listen(
-                            source,
-                            timeout=5,            # 最长等待 5 秒
-                            phrase_time_limit=15,  # 单段最长 15 秒
-                        )
-                    except sr.WaitTimeoutError:
-                        continue
-
-                    if self._stop_event.is_set():
-                        break
-
-                    # 在子线程中异步识别，避免阻塞监听循环
-                    threading.Thread(
-                        target=self._recognize,
-                        args=(recognizer, audio),
-                        daemon=True,
-                    ).start()
-        except Exception:
-            logger.exception("[LocalASR] microphone error")
-
-    def _recognize(self, recognizer, audio):
-        """调用 Google 免费 API 识别一段音频"""
-        import speech_recognition as sr
-        try:
-            text = recognizer.recognize_google(audio, language="zh-CN")
-            if text and self._running:
-                self.on_text(text, True)
-        except sr.UnknownValueError:
-            pass  # 没听清，正常忽略
-        except sr.RequestError as e:
-            logger.error("[LocalASR] Google API error: %s", e)
-        except Exception:
-            logger.exception("[LocalASR] recognition error")
-
-    def stop(self):
-        self._running = False
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        logger.info("[LocalASR] stopped")
-
-
-# =====================================================================
-# Windows 内置 ASR 实现（WinRT）
-# =====================================================================
-
-class WindowsBuiltInASR(BaseASR):
-    """
-    Windows 内置语音识别（WinRT SpeechRecognizer）。
-
-    说明：
-    - 仅 Windows 可用；非 Windows 环境会自动降级为不可用日志。
-    - 依赖 pip 包 winsdk（Windows Runtime for Python）。
-    """
-
-    def __init__(self, on_text: Callable[[str, bool], None]):
-        super().__init__(on_text)
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._ready_event = threading.Event()
-        self._start_error: str | None = None
-
-    @staticmethod
-    def _diagnose_start_failure(exc: Exception) -> str:
-        raw = str(exc).strip() or exc.__class__.__name__
-        lowered = raw.lower()
-
-        hints = [
-            "请确认系统“设置 > 隐私和安全性 > 麦克风”已允许应用访问麦克风",
-            "请确认系统已安装语音识别能力与中文语音包",
-            "请确认没有其他应用独占麦克风设备",
-        ]
-
-        if "access is denied" in lowered or "0x80070005" in lowered:
-            hints.insert(0, "检测到权限拒绝，通常是麦克风隐私权限未开启")
-        elif "class not registered" in lowered or "0x80040154" in lowered:
-            hints.insert(0, "检测到 WinRT 组件不可用，请检查 Windows 语音组件安装")
-        elif "0x80045509" in lowered:
-            hints.insert(0, "检测到语音识别策略限制，请先在 Windows 中启用在线语音识别")
-
-        return f"WindowsBuiltInASR recognition failed: {raw}. {'；'.join(hints)}"
-
-    @staticmethod
-    def _bind_session_event(session, event_name: str, handler):
-        """兼容不同 winsdk 投影的事件绑定方式。"""
-        candidate_names = [
-            event_name,
-            event_name.replace("_", ""),
-            "".join(part.capitalize() if idx else part for idx, part in enumerate(event_name.split("_"))),
-        ]
-
-        for name in candidate_names:
-            if hasattr(session, name):
-                event_obj = getattr(session, name)
-                event_obj += handler
-                return ("attr", name, handler)
-
-            add_name = f"add_{name}"
-            if hasattr(session, add_name):
-                token = getattr(session, add_name)(handler)
-                return ("add", name, token)
-
-        raise AttributeError(
-            f"'{type(session).__name__}' has no compatible event for '{event_name}'"
-        )
-
-    @staticmethod
-    def _unbind_session_event(session, binding):
-        if not binding:
-            return
-
-        bind_type, event_name, token_or_handler = binding
-        if bind_type == "attr" and hasattr(session, event_name):
-            event_obj = getattr(session, event_name)
-            event_obj -= token_or_handler
-            return
-
-        if bind_type == "add":
-            remove_name = f"remove_{event_name}"
-            if hasattr(session, remove_name):
-                getattr(session, remove_name)(token_or_handler)
-
-    def start(self):
-        if os.name != "nt":
-            raise RuntimeError("WindowsBuiltInASR only available on Windows")
-
-        # 预检依赖，避免外层返回已启动但内部立刻失败。
-        try:
-            from winsdk.windows.media.speechrecognition import SpeechRecognizer  # noqa: F401
-        except Exception as exc:
-            raise RuntimeError(f"winsdk import failed: {exc}") from exc
-
-        self._running = True
-        self._stop_event.clear()
-        self._ready_event.clear()
-        self._start_error = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-        if not self._ready_event.wait(timeout=5):
-            self.stop()
-            raise RuntimeError("WindowsBuiltInASR start timeout")
-
-        if self._start_error:
-            err = self._start_error
-            self.stop()
-            raise RuntimeError(err)
-
-        logger.info("[WindowsBuiltInASR] started")
-
-    def _run(self):
-        if os.name != "nt":
-            self._start_error = "WindowsBuiltInASR only available on Windows"
-            self._ready_event.set()
-            logger.error("[WindowsBuiltInASR] only available on Windows")
-            return
-
-        try:
-            import asyncio
-            asyncio.run(self._run_async())
-        except Exception:
-            if not self._ready_event.is_set():
-                self._start_error = "WindowsBuiltInASR run loop failed"
-                self._ready_event.set()
-            logger.exception("[WindowsBuiltInASR] run loop failed")
-
-    async def _run_async(self):
-        try:
-            from winsdk.windows.media.speechrecognition import (
-                SpeechRecognizer,
-                SpeechRecognitionScenario,
-                SpeechRecognitionTopicConstraint,
-            )
-        except Exception as exc:
-            self._start_error = f"winsdk import failed: {exc}"
-            self._ready_event.set()
-            logger.exception(
-                "[WindowsBuiltInASR] failed to import winsdk. Please install dependency: winsdk"
-            )
-            return
-
-        recognizer = None
-        result_binding = None
-        try:
-            recognizer = SpeechRecognizer()
-
-            # 使用听写约束，提升课堂口语场景识别效果
-            try:
-                recognizer.constraints.append(
-                    SpeechRecognitionTopicConstraint(
-                        SpeechRecognitionScenario.dictation,
-                        "dictation",
-                    )
-                )
-            except Exception:
-                logger.exception("[WindowsBuiltInASR] failed to add dictation constraint")
-
-            compile_result = await recognizer.compile_constraints_async()
-            compile_status_obj = getattr(compile_result, "status", None)
-
-            compile_status_name = "unknown"
-            if compile_status_obj is not None:
-                compile_status_name = getattr(compile_status_obj, "name", None) or str(compile_status_obj)
-
-            is_compile_success = False
-            if compile_status_obj is not None:
-                try:
-                    # WinRT SpeechRecognitionResultStatus.Success 枚举值通常为 0。
-                    is_compile_success = int(compile_status_obj) == 0
-                except Exception:
-                    is_compile_success = False
-
-            if not is_compile_success:
-                status_lower = compile_status_name.lower()
-                is_compile_success = status_lower in {"success", "speechrecognitionresultstatus.success"}
-
-            if not is_compile_success:
-                msg = f"compile constraints failed, status={compile_status_name}"
-                self._start_error = msg
-                self._ready_event.set()
-                logger.error("[WindowsBuiltInASR] %s", msg)
-                return
-
-            session = recognizer.continuous_recognition_session
-
-            def _on_result_generated(_sender, args):
-                if not self._running:
-                    return
-                try:
-                    result = getattr(args, "result", None)
-                    text = (getattr(result, "text", "") or "").strip()
-                    if text:
-                        # 连续识别回调按整句回调，视作 final
-                        self.on_text(text, True)
-                except Exception:
-                    logger.exception("[WindowsBuiltInASR] result callback failed")
-
-            result_binding = self._bind_session_event(session, "result_generated", _on_result_generated)
-            logger.info("[WindowsBuiltInASR] starting continuous recognition session...")
-            await session.start_async()
-            logger.info("[WindowsBuiltInASR] continuous recognition running")
-            self._ready_event.set()
-
-            while not self._stop_event.is_set():
-                await asyncio.sleep(0.2)
-
-            try:
-                await session.stop_async()
-            except Exception:
-                logger.exception("[WindowsBuiltInASR] failed to stop continuous session")
-        except Exception as exc:
-            if not self._ready_event.is_set():
-                self._start_error = self._diagnose_start_failure(exc)
-                self._ready_event.set()
-            logger.exception("[WindowsBuiltInASR] recognition failed")
-        finally:
-            try:
-                if recognizer is not None:
-                    session = recognizer.continuous_recognition_session
-                    self._unbind_session_event(session, result_binding)
-            except Exception:
-                logger.exception("[WindowsBuiltInASR] failed to unbind result callback")
-            recognizer = None
-
-    def stop(self):
-        self._running = False
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self._ready_event.clear()
-        logger.info("[WindowsBuiltInASR] stopped")
-
-
-# =====================================================================
-# C# WinRT 桥接实现
-# =====================================================================
-
-def _load_winasr_bridge_module():
-    module_name = "_classassistant_winasr_service"
-    cached_module = sys.modules.get(module_name)
-    if cached_module is not None:
-        return cached_module
-
-    bridge_path = Path(__file__).resolve().parents[2] / "winasr" / "winasr_service.py"
-    if not bridge_path.exists():
-        raise RuntimeError(f"winasr bridge file not found: {bridge_path}")
-
-    spec = importlib.util.spec_from_file_location(module_name, bridge_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load winasr bridge module: {bridge_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-class WinAsrBridgeASR(BaseASR):
-    """通过 `winasr/` 目录下的 C# WinRT 控制台程序识别语音。"""
-
-    def __init__(self, on_text: Callable[[str, bool], None], language: str | None = None):
-        super().__init__(on_text)
-        self.language = (language or os.getenv("WINASR_LANGUAGE", "")).strip() or None
-        self._impl = None
-
-    def start(self):
-        bridge_module = _load_winasr_bridge_module()
-        create_service = getattr(bridge_module, "create_service", None)
-        if not callable(create_service):
-            raise RuntimeError("winasr_service.py does not expose create_service()")
-
-        self._running = True
-        self._impl = create_service(on_text=self.on_text, language=self.language)
-        self._impl.start()
-        logger.info("[WinAsrBridgeASR] started")
-
-    def stop(self):
-        self._running = False
-        if self._impl is not None:
-            try:
-                self._impl.stop()
-            finally:
-                self._impl = None
-        logger.info("[WinAsrBridgeASR] stopped")
-
-
-# =====================================================================
-# DashScope Fun-ASR 实现
-# =====================================================================
-
-class DashScopeASR(BaseASR):
-    """
-    阿里云百炼 Fun-ASR 实时语音识别
-    使用 dashscope SDK 的 Recognition + RecognitionCallback
-    """
-
-    def __init__(self, on_text: Callable[[str, bool], None], model_name: str | None = None):
-        super().__init__(on_text)
-        self.model_name = (model_name or os.getenv("DASHSCOPE_ASR_MODEL", "fun-asr-realtime")).strip() or "fun-asr-realtime"
-        self._recognition = None
-        self._mic: Optional[pyaudio.PyAudio] = None
-        self._stream = None
-        self._send_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-    def start(self):
-        import dashscope
-        from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
-
-        api_key = os.getenv("DASHSCOPE_API_KEY", "")
-        if not api_key:
-            logger.error("[DashScopeASR] DASHSCOPE_API_KEY not set")
-            return
-
-        dashscope.api_key = api_key
-        dashscope.base_websocket_api_url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
-
-        self._running = True
-        self._stop_event.clear()
-
-        on_text_cb = self.on_text  # capture for inner class
-
-        class _Callback(RecognitionCallback):
-            def on_open(self_cb) -> None:
-                logger.info("[DashScopeASR] connection opened")
-
-            def on_close(self_cb) -> None:
-                logger.info("[DashScopeASR] connection closed")
-
-            def on_complete(self_cb) -> None:
-                logger.info("[DashScopeASR] recognition completed")
-
-            def on_error(self_cb, message) -> None:
-                logger.error("[DashScopeASR] error: %s", message.message)
-
-            def on_event(self_cb, result: RecognitionResult) -> None:
-                sentence = result.get_sentence()
-                if "text" in sentence:
-                    text = sentence["text"]
-                    is_final = RecognitionResult.is_sentence_end(sentence)
-                    if text:
-                        on_text_cb(text, is_final)
-
-        callback = _Callback()
-        self._recognition = Recognition(
-            model=self.model_name,
-            format="pcm",
-            sample_rate=SAMPLE_RATE,
-            semantic_punctuation_enabled=False,
-            callback=callback,
-        )
-
-        # 启动识别
-        self._recognition.start()
-
-        # 在单独线程中开启麦克风录音并推流
-        self._send_thread = threading.Thread(target=self._audio_loop, daemon=True)
-        self._send_thread.start()
-        logger.info("[DashScopeASR] started (model=%s)", self.model_name)
-
-    def _audio_loop(self):
-        """持续从麦克风读取音频并发送到 ASR"""
-        try:
-            self._mic = pyaudio.PyAudio()
-            self._stream = self._mic.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-            )
-
-            while not self._stop_event.is_set():
-                data = self._stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                if self._recognition:
-                    self._recognition.send_audio_frame(data)
-        except Exception:
-            logger.exception("[DashScopeASR] audio loop error")
-        finally:
-            if self._stream:
-                self._stream.stop_stream()
-                self._stream.close()
-            if self._mic:
-                self._mic.terminate()
-            self._stream = None
-            self._mic = None
-
-    def stop(self):
-        self._running = False
-        self._stop_event.set()
-
-        # 等待音频线程结束
-        if self._send_thread and self._send_thread.is_alive():
-            self._send_thread.join(timeout=3)
-
-        # 停止 ASR（会阻塞直到 on_complete / on_error）
-        if self._recognition:
-            try:
-                self._recognition.stop()
-            except Exception:
-                logger.exception("[DashScopeASR] error stopping recognition")
-            self._recognition = None
-
-        logger.info("[DashScopeASR] stopped")
-
-
-# =====================================================================
-# Seed-ASR (字节跳动) 实现
-# =====================================================================
-
-class SeedASR(BaseASR):
-    """
-    字节跳动 Seed-ASR 大模型语音识别
-    通过 WebSocket 二进制协议流式交互
-    """
-
-    # WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
-    WS_URL = os.getenv("SEED_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async")
-
-    def __init__(self, on_text: Callable[[str, bool], None]):
-        super().__init__(on_text)
-        self._ws = None
-        self._mic: Optional[pyaudio.PyAudio] = None
-        self._stream = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._seen_utterances: set[tuple[int | None, int | None, str]] = set()
-
-    # ---- 二进制协议辅助 ----
-
-    @staticmethod
-    def _build_header(msg_type: int, msg_flags: int, serial: int, compress: int) -> bytes:
-        """构造 4 字节 header"""
-        b0 = (0x1 << 4) | 0x1           # version=1, header_size=1 (4 bytes)
-        b1 = (msg_type << 4) | msg_flags
-        b2 = (serial << 4) | compress
-        b3 = 0x00
-        return bytes([b0, b1, b2, b3])
-
-    @staticmethod
-    def _build_full_request(payload_json: dict) -> bytes:
-        """构造 full client request 帧"""
-        header = SeedASR._build_header(
-            msg_type=0x1,      # full client request
-            msg_flags=0x0,
-            serial=0x1,        # JSON
-            compress=0x1,      # Gzip
-        )
-        payload_bytes = gzip.compress(json.dumps(payload_json).encode("utf-8"))
-        size = struct.pack(">I", len(payload_bytes))
-        return header + size + payload_bytes
-
-    @staticmethod
-    def _build_audio_frame(audio_data: bytes, is_last: bool = False) -> bytes:
-        """构造 audio-only client request 帧"""
-        header = SeedASR._build_header(
-            msg_type=0x2,                          # audio only
-            msg_flags=0x2 if is_last else 0x0,     # 0x2 = last frame
-            serial=0x0,                            # no serialization
-            compress=0x1,                          # Gzip
-        )
-        payload_bytes = gzip.compress(audio_data)
-        size = struct.pack(">I", len(payload_bytes))
-        return header + size + payload_bytes
-
-    @staticmethod
-    def _parse_server_response(data: bytes) -> Optional[dict]:
-        """解析 full server response，返回 JSON payload 或 None"""
-        try:
-            if len(data) < 4:
-                return None
-
-            b1 = data[1]
-            msg_type = (b1 >> 4) & 0xF
-
-            if msg_type == 0xF:
-                # error message
-                if len(data) >= 12:
-                    err_code = struct.unpack(">I", data[4:8])[0]
-                    err_size = struct.unpack(">I", data[8:12])[0]
-                    err_msg = data[12:12 + err_size].decode("utf-8", errors="replace")
-                    logger.error("[SeedASR] server error %d: %s", err_code, err_msg)
-                return None
-
-            if msg_type != 0x9:
-                return None
-
-            b2 = data[2]
-            compress = b2 & 0xF
-
-            # sequence (4 bytes) + payload_size (4 bytes)
-            if len(data) < 12:
-                return None
-            payload_size = struct.unpack(">I", data[8:12])[0]
-            payload_raw = data[12:12 + payload_size]
-
-            if payload_size <= 0 or not payload_raw:
-                return None
-
-            if compress == 0x1:
-                payload_raw = gzip.decompress(payload_raw)
-
-            if not payload_raw:
-                return None
-
-            try:
-                return json.loads(payload_raw)
-            except JSONDecodeError:
-                preview = payload_raw[:80].decode("utf-8", errors="replace")
-                logger.debug("[SeedASR] skip non-json response payload: %s", preview)
-                return None
-        except Exception:
-            logger.exception("[SeedASR] failed to parse server response")
-            return None
-
-    def start(self):
-        self._running = True
-        self._stop_event.clear()
-        self._seen_utterances.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info("[SeedASR] started")
-
-    def _process_response(self, resp_data):
-        """处理单条服务端响应，提取文本并回调"""
-        if not isinstance(resp_data, bytes):
-            return
-        try:
-            resp = self._parse_server_response(resp_data)
-            if resp and isinstance(resp.get("result"), dict):
-                result = resp["result"]
-                utterances = result.get("utterances") or []
-
-                for utterance in utterances:
-                    text = (utterance.get("text") or "").strip()
-                    if not text or not utterance.get("definite"):
-                        continue
-
-                    utterance_key = (
-                        utterance.get("start_time"),
-                        utterance.get("end_time"),
-                        text,
-                    )
-                    if utterance_key in self._seen_utterances:
-                        continue
-
-                    self._seen_utterances.add(utterance_key)
-                    logger.info("[SeedASR] definite utterance: %s", text[:80])
-                    self.on_text(text, True)
-
-                if utterances:
-                    last_utterance = utterances[-1]
-                    partial_text = (last_utterance.get("text") or "").strip()
-                    if partial_text and not last_utterance.get("definite"):
-                        self.on_text(partial_text, False)
-                else:
-                    text = (result.get("text") or "").strip()
-                    if text:
-                        logger.info("[SeedASR] partial text: %s", text[:80])
-                        self.on_text(text, False)
-        except Exception:
-            logger.exception("[SeedASR] error processing server response")
-
-    def _recv_loop(self):
-        """独立接收线程：持续读取服务端响应"""
-        import websocket
-        while not self._stop_event.is_set():
-            try:
-                if self._ws is None:
-                    break
-                resp_data = self._ws.recv()
-                self._process_response(resp_data)
-            except (websocket.WebSocketTimeoutException, TimeoutError):
-                continue
-            except websocket.WebSocketConnectionClosedException:
-                logger.info("[SeedASR] connection closed by server")
-                break
-            except Exception:
-                if not self._stop_event.is_set():
-                    logger.exception("[SeedASR] recv error")
-                break
-
-    def _run(self):
-        """工作线程：建连 → 发送 full request → 流式推音频（接收在独立线程）"""
-        import websocket  # websocket-client 库
-
-        app_key = os.getenv("SEED_ASR_APP_KEY", "")
-        access_key = os.getenv("SEED_ASR_ACCESS_KEY", "")
-        resource_id = os.getenv("SEED_ASR_RESOURCE_ID", "volc.seedasr.sauc.duration")
-
-        if not app_key or not access_key:
-            logger.error("[SeedASR] SEED_ASR_APP_KEY / SEED_ASR_ACCESS_KEY not set")
-            return
-
-        connect_id = str(uuid.uuid4())
-
-        headers = {
-            "X-Api-App-Key": app_key,
-            "X-Api-Access-Key": access_key,
-            "X-Api-Resource-Id": resource_id,
-            "X-Api-Connect-Id": connect_id,
-        }
-
-        logger.info("[SeedASR] connecting to %s (resource_id=%s)", self.WS_URL, resource_id)
-
-        recv_thread = None
-        try:
-            self._ws = websocket.create_connection(
-                self.WS_URL,
-                header=[f"{k}: {v}" for k, v in headers.items()],
-                timeout=10,
-            )
-            logger.info("[SeedASR] websocket connected")
-
-            # 1) 发送 full client request
-            full_req_payload = {
-                "user": {"uid": "class-assistant"},
-                "audio": {
-                    "format": "pcm",
-                    "rate": SAMPLE_RATE,
-                    "bits": 16,
-                    "channel": CHANNELS,
-                },
-                "request": {
-                    "model_name": "bigmodel",
-                    "enable_punc": True,
-                    "enable_itn": True,
-                    "show_utterances": True,
-                    # 在流式优化版中显式开启静音判停，让一句结束后尽快产出 definite 分句。
-                    "end_window_size": 800,
-                    "force_to_speech_time": 1000,
-                    "result_type": "single",
-                },
-            }
-            self._ws.send(self._build_full_request(full_req_payload), opcode=0x2)
-
-            # 读取 full request 的 ack
-            ack = self._ws.recv()
-            if isinstance(ack, bytes):
-                resp = self._parse_server_response(ack)
-                logger.info("[SeedASR] full request ack: %s", resp)
-
-            # 2) 启动独立接收线程
-            self._ws.settimeout(1)  # recv 线程每秒检查一次 stop_event
-            recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-            recv_thread.start()
-
-            # 3) 开启麦克风，循环发送音频帧
-            self._mic = pyaudio.PyAudio()
-            self._stream = self._mic.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-            )
-
-            logger.info("[SeedASR] microphone opened, streaming audio...")
-
-            while not self._stop_event.is_set():
-                audio_data = self._stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                try:
-                    self._ws.send(self._build_audio_frame(audio_data, is_last=False), opcode=0x2)
-                except Exception:
-                    if not self._stop_event.is_set():
-                        logger.exception("[SeedASR] send error")
-                    break
-
-            # 4) 发送最后一帧（负包）
-            try:
-                self._ws.send(self._build_audio_frame(b"", is_last=True), opcode=0x2)
-            except Exception:
-                pass
-
-            # 等待接收线程处理完最终结果
-            if recv_thread and recv_thread.is_alive():
-                recv_thread.join(timeout=5)
-
-        except Exception:
-            logger.exception("[SeedASR] connection/stream error")
-        finally:
-            if self._stream:
-                self._stream.stop_stream()
-                self._stream.close()
-            if self._mic:
-                self._mic.terminate()
-            if self._ws:
-                try:
-                    self._ws.close()
-                except Exception:
-                    pass
-            self._stream = None
-            self._mic = None
-            self._ws = None
-            if recv_thread and recv_thread.is_alive():
-                recv_thread.join(timeout=2)
-
-    def stop(self):
-        self._running = False
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        logger.info("[SeedASR] stopped")
-
-
-# =====================================================================
 # 浏览器 Web Speech 识别占位实现
 # =====================================================================
 
@@ -884,6 +87,215 @@ class BrowserSpeechASR(BaseASR):
 
 
 # =====================================================================
+# sherpa-onnx 本地流式识别实现（streaming Zipformer, CPU）
+# =====================================================================
+
+class SherpaOnnxASR(BaseASR):
+    """
+    基于 sherpa-onnx 的本地流式语音识别。
+
+    - 使用 streaming Zipformer transducer 模型，纯 CPU 推理，无需联网。
+    - 模型目录解析顺序：SHERPA_MODEL_DIR > MODELS_DIR/<SHERPA_MODEL_NAME>
+    - 通过 sherpa 内置端点检测断句：说完一句话（默认 2.4s 静音）回调 is_final=True，
+      说话过程中的中间结果回调 is_final=False。
+    - 可用 SHERPA_INPUT_DEVICE 指定输入设备索引（如立体声混音），缺省用系统默认麦克风。
+    """
+
+    def __init__(self, on_text: Callable[[str, bool], None]):
+        super().__init__(on_text)
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._mic: Optional[pyaudio.PyAudio] = None
+        self._stream = None
+
+    @staticmethod
+    def _resolve_model_dir() -> Path:
+        env_dir = os.getenv("SHERPA_MODEL_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir)
+
+        model_name = os.getenv(
+            "SHERPA_MODEL_NAME",
+            "sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16",
+        ).strip()
+        return Path(MODELS_DIR) / model_name
+
+    @staticmethod
+    def _find_model_files(model_dir: Path) -> dict[str, Path]:
+        """在模型目录中定位 tokens / encoder / decoder / joiner 文件。"""
+        if not model_dir.is_dir():
+            raise RuntimeError(
+                f"sherpa 模型目录不存在: {model_dir}。"
+                "请设置 SHERPA_MODEL_DIR，或将模型放到 models/ 下"
+            )
+
+        files: dict[str, Path] = {}
+
+        tokens = model_dir / "tokens.txt"
+        if not tokens.exists():
+            raise RuntimeError(f"缺少 tokens.txt: {model_dir}")
+        files["tokens"] = tokens
+
+        def pick(prefix: str) -> Path:
+            candidates = sorted(model_dir.glob(f"{prefix}*.onnx"))
+            if not candidates:
+                raise RuntimeError(f"模型目录缺少 {prefix}*.onnx: {model_dir}")
+            # 优先 int8 量化版本（体积小、CPU 上更快）
+            int8 = [p for p in candidates if "int8" in p.name]
+            return (int8 or candidates)[0]
+
+        files["encoder"] = pick("encoder")
+        files["decoder"] = pick("decoder")
+        files["joiner"] = pick("joiner")
+        return files
+
+    @staticmethod
+    def _resolve_input_device(mic: "pyaudio.PyAudio") -> int | None:
+        """解析输入设备索引；未配置 SHERPA_INPUT_DEVICE 时用系统默认。"""
+        raw = os.getenv("SHERPA_INPUT_DEVICE", "").strip()
+        if raw == "":
+            return None
+        try:
+            index = int(raw)
+        except ValueError:
+            logger.warning("[SherpaASR] 非法的 SHERPA_INPUT_DEVICE=%r，使用默认设备", raw)
+            return None
+
+        info = mic.get_device_info_by_index(index)
+        if info.get("maxInputChannels", 0) <= 0:
+            raise RuntimeError(f"设备 {index} ({info.get('name')}) 不是输入设备")
+        logger.info("[SherpaASR] using input device [%d] %s", index, info.get("name"))
+        return index
+
+    def start(self):
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise RuntimeError(f"sherpa_onnx 未安装: {exc}") from exc
+
+        model_dir = self._resolve_model_dir()
+        files = self._find_model_files(model_dir)
+
+        num_threads = int(os.getenv("SHERPA_NUM_THREADS", "2"))
+        rule1 = float(os.getenv("SHERPA_RULE1_SILENCE", "2.4"))
+
+        logger.info(
+            "[SherpaASR] loading model from %s (threads=%d, encoder=%s)",
+            model_dir, num_threads, files["encoder"].name,
+        )
+        try:
+            recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=str(files["tokens"]),
+                encoder=str(files["encoder"]),
+                decoder=str(files["decoder"]),
+                joiner=str(files["joiner"]),
+                num_threads=num_threads,
+                sample_rate=SAMPLE_RATE,
+                feature_dim=80,
+                enable_endpoint_detection=True,
+                rule1_min_trailing_silence=rule1,
+                rule2_min_trailing_silence=1.2,
+                rule3_min_utterance_length=20.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"sherpa 模型加载失败: {exc}") from exc
+
+        self._running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(recognizer,), daemon=True
+        )
+        self._thread.start()
+        logger.info("[SherpaASR] started")
+
+    def _run(self, recognizer):
+        """工作线程：开麦 → 循环喂音频 → 解码 → 按端点回调"""
+        try:
+            self._mic = pyaudio.PyAudio()
+            device_index = self._resolve_input_device(self._mic)
+            self._stream = self._mic.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                input_device_index=device_index,
+                frames_per_buffer=CHUNK_SIZE,
+            )
+        except Exception as exc:
+            logger.exception("[SherpaASR] microphone open failed")
+            self.on_error(f"麦克风打开失败: {exc}")
+            return
+
+        import array
+
+        stream = recognizer.create_stream()
+        last_partial = ""
+        last_log = 0.0
+
+        try:
+            while not self._stop_event.is_set():
+                data = self._stream.read(CHUNK_SIZE, exception_on_overflow=False)
+
+                pcm = array.array("h", data)
+                samples = [sample / 32768.0 for sample in pcm]
+                stream.accept_waveform(SAMPLE_RATE, samples)
+
+                while recognizer.is_ready(stream):
+                    recognizer.decode_stream(stream)
+
+                text = recognizer.get_result(stream).strip()
+
+                if recognizer.is_endpoint(stream):
+                    if text:
+                        self.on_text(text, True)
+                    recognizer.reset(stream)
+                    last_partial = ""
+                elif text and text != last_partial:
+                    last_partial = text
+                    self.on_text(text, False)
+
+                now = time.time()
+                if last_partial and now - last_log > 5.0:
+                    last_log = now
+                    logger.info("[SherpaASR] partial: %s", last_partial[:60])
+        except Exception:
+            logger.exception("[SherpaASR] audio loop error")
+            self.on_error("本地识别循环异常，请查看后端日志")
+        finally:
+            self._close_audio()
+
+    def on_error(self, message: str):
+        """把致命错误转成一句 final 文本注入监控，让前端能感知到。"""
+        try:
+            self.on_text(message, True)
+        except Exception:
+            logger.exception("[SherpaASR] error notify failed")
+
+    def _close_audio(self):
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._mic:
+            try:
+                self._mic.terminate()
+            except Exception:
+                pass
+            self._mic = None
+
+    def stop(self):
+        self._running = False
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        self._close_audio()
+        logger.info("[SherpaASR] stopped")
+
+
+# =====================================================================
 # 工厂函数
 # =====================================================================
 
@@ -893,24 +305,19 @@ def create_asr(on_text: Callable[[str, bool], None], asr_model: str | None = Non
 
     Args:
         on_text: 文本回调 (text, is_final)
-        asr_model: 可选 ASR 模型名（当前对 DashScope 生效）
+        asr_model: 保留参数位，当前未使用
 
     Returns:
         BaseASR 子类实例
     """
-    mode = os.getenv("ASR_MODE", "local").lower()
-    logger.info("[ASR] mode=%s, dashscope_model=%s", mode, (asr_model or "").strip() or "(env/default)")
-    if mode == "local":
-        return LocalASR(on_text)
-    elif mode == "windows":
-        return WindowsBuiltInASR(on_text)
-    elif mode == "winasr":
-        return WinAsrBridgeASR(on_text)
-    elif mode in {"webspeech", "edge-webspeech", "browser"}:
+    mode = os.getenv("ASR_MODE", "webspeech").lower().strip()
+    logger.info("[ASR] mode=%s", mode)
+    if mode in {"webspeech", "edge-webspeech", "browser"}:
         return BrowserSpeechASR(on_text)
-    elif mode == "dashscope":
-        return DashScopeASR(on_text, model_name=asr_model)
-    elif mode == "seed-asr":
-        return SeedASR(on_text)
-    else:
+    elif mode in {"sherpa", "sherpa-onnx", "local"}:
+        return SherpaOnnxASR(on_text)
+    elif mode == "mock":
         return MockASR(on_text)
+    else:
+        logger.warning("[ASR] unknown mode %r, fallback to webspeech", mode)
+        return BrowserSpeechASR(on_text)

@@ -55,11 +55,7 @@ async def start_monitor(request: StartMonitorRequest):
     if result.get("status") == "started":
         from os import getenv
 
-        mode = getenv("ASR_MODE", "local").strip().lower()
-        if mode == "windows":
-            mode = "winasr"
-
-        result["effective_asr_mode"] = mode
+        result["effective_asr_mode"] = getenv("ASR_MODE", "webspeech").strip().lower()
         result["webspeech_lang"] = getenv("WEBSPEECH_LANG", "zh-CN").strip() or "zh-CN"
     return result
 

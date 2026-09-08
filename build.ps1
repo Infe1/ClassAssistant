@@ -126,10 +126,26 @@ New-Item -ItemType Directory -Path (Join-Path $RELEASE_DIR "data\summaries") -Fo
 
 # 复制后端
 Write-Host "      复制后端文件 ..."
-$backendDist = Join-Path $API_DIR "dist\class-assistant-backend"
+$backendDist = Join-Path $API_DIR "dist\class-fox-lite-backend"
 Copy-Item "$backendDist\*" (Join-Path $RELEASE_DIR "backend") -Recurse -Force
 Copy-Item (Join-Path $API_DIR ".env.example") (Join-Path $RELEASE_DIR "backend\.env.example") -Force
 Copy-Item (Join-Path $API_DIR ".env.example") (Join-Path $RELEASE_DIR "backend\.env") -Force
+
+# 复制 sherpa 本地模型（只带 int8 量化版 + tokens，约 48MB）
+$sherpaModelName = "sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16"
+$sherpaSrc = Join-Path $ROOT "models\$sherpaModelName"
+if (Test-Path $sherpaSrc) {
+    Write-Host "      复制 sherpa 模型 (int8) ..."
+    $sherpaDst = Join-Path $RELEASE_DIR "models\$sherpaModelName"
+    New-Item -ItemType Directory -Path $sherpaDst -Force | Out-Null
+    Copy-Item (Join-Path $sherpaSrc "tokens.txt") $sherpaDst -Force
+    Copy-Item (Get-Item (Join-Path $sherpaSrc "encoder-*.int8.onnx")) $sherpaDst -Force
+    Copy-Item (Get-Item (Join-Path $sherpaSrc "decoder-*.int8.onnx")) $sherpaDst -Force
+    Copy-Item (Get-Item (Join-Path $sherpaSrc "joiner-*.int8.onnx")) $sherpaDst -Force
+}
+else {
+    Write-Host "      [warn] 未找到 sherpa 模型目录 ($sherpaSrc)，发布包将不含本地识别模型" -ForegroundColor Yellow
+}
 
 # 复制前端 exe（尝试 productName，回退到 Cargo name）
 Write-Host "      复制前端文件 ..."
@@ -180,7 +196,7 @@ $testEnvContent = "API_PORT=$testPort`nASR_MODE=mock`n"
 [string]$releaseEnvBackup = [IO.File]::ReadAllText($testEnv)
 [IO.File]::WriteAllText($testEnv, $testEnvContent)
 
-$backendExe = Join-Path $RELEASE_DIR "backend\class-assistant-backend.exe"
+$backendExe = Join-Path $RELEASE_DIR "backend\class-fox-lite-backend.exe"
 $proc = $null
 $testOk = $false
 $startupDeadlineSec = 20

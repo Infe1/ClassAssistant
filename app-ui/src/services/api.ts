@@ -4,8 +4,8 @@
  * 封装所有与 FastAPI 后端的 HTTP 通信
  */
 
-// 后端地址（开发环境）
-export const API_BASE = "http://127.0.0.1:8765/api";
+// 后端地址（Lite 版默认 8766，与正式版 8765 并行不冲突）
+export const API_BASE = "http://127.0.0.1:8766/api";
 
 /**
  * 上传 PPT 文件到后端进行解析
