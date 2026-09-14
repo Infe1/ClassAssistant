@@ -1,7 +1,7 @@
 {
   "name": "app-ui",
   "private": true,
-  "version": "1.2.0",
+  "version": "2.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -31,5 +31,8 @@
     "tailwindcss": "^4.2.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.3"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
   }
 }

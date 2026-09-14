@@ -60,6 +60,7 @@ function MainApp() {
   const [citeRefreshToken, setCiteRefreshToken] = useState(0);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [activeCourseName, setActiveCourseName] = useState("");
+  const [alertSuspended, setAlertSuspended] = useState(false);
   const browserAsrSessionRef = useRef<BrowserAsrSession | null>(null);
   const activeAsrModeRef = useRef("local");
   const activeBrowserAsrLangRef = useRef("zh-CN");
@@ -67,6 +68,10 @@ function MainApp() {
   // WebSocket 连接
   const { lastAlert, alertActive, connect, disconnect, dismissAlert } =
     useWebSocket();
+
+  // 用户点「查看」后，警报不真正消失，只是被 AI 面板顶下去；
+  // alertSuspended=true 时隐藏弹层，面板关闭后自动恢复原来的警示状态。
+  const alertVisible = alertActive && !alertSuspended;
 
   useEffect(() => {
     applyUiStyleSettings(readUiStyleSettings());
@@ -94,13 +99,16 @@ function MainApp() {
         if (transcriptExpanded && aiExpanded) {
           height = Math.max(height, 580);
         }
+        if (alertVisible && !aiExpanded) {
+          height = Math.max(height, 160);
+        }
 
         await win.setSize(new LogicalSize(width, height));
       } catch {
         /* 忽略窗口操作错误 */
       }
     })();
-  }, [toolbarMoreExpanded, transcriptExpanded, aiExpanded, showStartMonitorPanel, showSettingsPanel]);
+  }, [toolbarMoreExpanded, transcriptExpanded, aiExpanded, alertVisible, showStartMonitorPanel, showSettingsPanel]);
 
   // ---- Toast 管理 ----
   const addToast = useCallback(
@@ -161,6 +169,7 @@ function MainApp() {
       disconnect();
       setIsMonitoring(false);
       setIsPaused(false);
+      setAlertSuspended(false);
       setActiveCourseName("");
       activeAsrModeRef.current = "local";
       setTranscriptExpanded(false);
@@ -279,18 +288,33 @@ function MainApp() {
 
   // ---- 救场 ----
   const handleRescue = useCallback(() => {
-    dismissAlert();
+    // 不真正清除警报：先「挂起」，AI 面板关闭后自动恢复原来的警示状态
+    setAlertSuspended(true);
     setAiMode("rescue");
     setTranscriptExpanded(true);
     setAiExpanded(true);
-  }, [dismissAlert]);
+  }, []);
 
   // ---- 老师讲到哪了 ----
   const handleCatchup = useCallback(() => {
-    dismissAlert();
+    // 同上：保留原来的警示状态，返回时重新弹出
+    setAlertSuspended(true);
     setAiMode("catchup");
     setTranscriptExpanded(true);
     setAiExpanded(true);
+  }, []);
+
+  // AI 面板关闭后，若警报仍然有效，恢复显示原来的警示弹层
+  useEffect(() => {
+    if (!aiExpanded && alertSuspended && alertActive) {
+      setAlertSuspended(false);
+    }
+  }, [aiExpanded, alertSuspended, alertActive]);
+
+  // 真正忽略警报（清除状态，不再恢复）
+  const handleDismissAlert = useCallback(() => {
+    setAlertSuspended(false);
+    dismissAlert();
   }, [dismissAlert]);
 
   const handleOpenSettings = useCallback(() => {
@@ -303,10 +327,21 @@ function MainApp() {
 
   return (
     <div className="app-shell relative flex h-full w-full flex-col overflow-hidden rounded-[var(--window-radius)] border border-[var(--theme-shell-border)] shadow-2xl backdrop-blur-xl">
-      {/* 标题栏 */}
-      <TitleBar isMonitoring={isMonitoring} isPaused={isPaused} courseName={activeCourseName} />
+      {/* 边角美术装饰层 */}
+      <div className="corner-art" aria-hidden="true">
+        <span className="corner corner--tl" />
+        <span className="corner corner--tr" />
+        <span className="corner corner--bl" />
+        <span className="corner corner--br" />
+        <span className="corner-sheen" />
+      </div>
 
-      <div className="flex min-h-0 flex-1 flex-col px-2 pb-2">
+      {/* 标题栏 */}
+      <div className="relative z-10">
+        <TitleBar isMonitoring={isMonitoring} isPaused={isPaused} courseName={activeCourseName} />
+      </div>
+
+      <div className="relative z-10 flex min-h-0 flex-1 flex-col px-2 pb-2">
         {/* 工具栏 */}
         {!showStartMonitorPanel && !showSettingsPanel && (
           <ToolBar
@@ -365,13 +400,13 @@ function MainApp() {
 
       {/* 点名警报覆盖层 */}
       <AlertOverlay
-        active={alertActive}
+        active={alertVisible}
         level={lastAlert?.level ?? "danger"}
         keywords={lastAlert?.keywords ?? []}
         text={lastAlert?.text ?? ""}
         onRescue={handleRescue}
         onCatchup={handleCatchup}
-        onDismiss={dismissAlert}
+        onDismiss={handleDismissAlert}
       />
 
       {/* Toast 提示 */}

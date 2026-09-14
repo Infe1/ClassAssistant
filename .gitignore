@@ -38,3 +38,9 @@ api-service/build/
 api-service/dist/
 release/
 *.zip
+
+# ---- 构建产物（补充）----
+build/
+winasr/obj/
+winasr/publish/
+app-ui/src-tauri/gen/

@@ -348,6 +348,16 @@ class LLMService:
 
 请生成课堂笔记。"""
 
+        # 思考型模型（如 deepseek-v4-flash-0731）会先产出很长的思维链（reasoning_content），
+        # 正文（content）在思维链之后。若 max_tokens 太小，思维链会把额度吃光，
+        # 导致 content 为空字符串——这正是"0 KB 总结文件"的根因。
+        # 实测（20095 字真实转录）：4000 必炸（正文 0 字），20000 稳定成功。
+        # 默认 20000，并允许用 .env 里的 SUMMARY_MAX_TOKENS 覆盖，无需再改代码。
+        try:
+            summary_max_tokens = int(os.getenv("SUMMARY_MAX_TOKENS", "20000"))
+        except ValueError:
+            summary_max_tokens = 20000
+
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -356,12 +366,35 @@ class LLMService:
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.5,
-                max_tokens=4000,
+                max_tokens=summary_max_tokens,
             )
-            return response.choices[0].message.content.strip()
-
         except Exception as e:
-            return f"# ⚠️ 总结生成失败\n\n错误信息: {str(e)}\n\n请检查 LLM API 配置。"
+            # 网络/鉴权/额度等调用失败：直接抛出去，绝不伪造成一份"笔记"。
+            raise RuntimeError(f"LLM 调用失败：{e}") from e
+
+        # 注意：以下解析与校验必须放在 try/except 之外。
+        # 之前把 raise 写在 try 内，会被下面自己的 except 吞掉，
+        # 变成一行"总结生成失败"字符串返回，反而写出假笔记（有内容但全是报错）。
+        choice = response.choices[0]
+        message = choice.message
+        content = (message.content or "").strip()
+
+        # 关键防线：绝不允许把空内容当作成功返回，否则会写出 0 字节的总结文件。
+        if not content:
+            reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+            if reasoning:
+                raise ValueError(
+                    f"LLM 只返回了思维链（{len(reasoning)} 字）而没有正文，"
+                    f"finish_reason={choice.finish_reason}。"
+                    "通常是因为 max_tokens 不足：请换用非思考型模型"
+                    "（如 deepseek-v4-pro）或调大 SUMMARY_MAX_TOKENS。"
+                )
+            raise ValueError(
+                f"LLM 返回了空内容（finish_reason={choice.finish_reason}），"
+                "请检查模型与 API 配置。"
+            )
+
+        return content
 
     async def compress_monitoring_progress(self, previous_summary: str, recent_lines: list[str]) -> str:
         """

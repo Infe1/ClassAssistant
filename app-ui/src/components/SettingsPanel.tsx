@@ -24,6 +24,12 @@ const ENV_SECTIONS: Array<{ title: string; fields: EnvFieldConfig[] }> = [
       { key: "LLM_API_KEY", label: "LLM API Key", type: "password", placeholder: "输入模型 API Key" },
       { key: "LLM_MODEL", label: "LLM 模型名", placeholder: "gpt-4o-mini" },
       {
+        key: "SUMMARY_MAX_TOKENS",
+        label: "总结最大 token（思考型模型需调大，建议 20000）",
+        type: "number",
+        placeholder: "20000",
+      },
+      {
         key: "ASR_MODE",
         label: "ASR 模式",
         type: "select",
@@ -79,34 +85,53 @@ function createEmptyEnvValues() {
   return Object.fromEntries(ALL_ENV_KEYS.map((key) => [key, ""])) as Record<string, string>;
 }
 
+const EXTRA_MARKER = "# 其他原始配置";
+
 function parseEnvContent(content: string) {
   const values = createEmptyEnvValues();
   const extras: string[] = [];
+  const allLines = content.split(/\r?\n/);
 
-  for (const line of content.split(/\r?\n/)) {
-    if (!line.trim()) {
-      extras.push(line);
-      continue;
-    }
+  // buildEnvContent 生成的文件里，本身带有自动生成的章节标题和「# 其他原始配置」标记。
+  // 若把这些行也当成"原始配置"收集，就会每保存一次多叠一层（历史 bug）。
+  // 因此以标记为界：标记之后的内容才是需要原样保留的原始配置。
+  const markerIndex = allLines.findIndex((line) => line.trim() === EXTRA_MARKER);
 
-    if (line.trimStart().startsWith("#")) {
-      extras.push(line);
-      continue;
-    }
-
+  const readKeyValue = (line: string) => {
     const separatorIndex = line.indexOf("=");
-    if (separatorIndex === -1) {
-      extras.push(line);
-      continue;
-    }
-
+    if (separatorIndex === -1) return;
     const key = line.slice(0, separatorIndex).trim();
+    if (!ALL_ENV_KEYS.includes(key)) return;
     const value = line.slice(separatorIndex + 1);
-    if (ALL_ENV_KEYS.includes(key)) {
-      values[key] = key === "ASR_MODE" && value.trim() === "windows" ? "winasr" : value;
-    } else {
-      extras.push(line);
+    values[key] = key === "ASR_MODE" && value.trim() === "windows" ? "winasr" : value;
+  };
+
+  if (markerIndex === -1) {
+    // 尚未保存过（首次加载旧文件）：沿用原始行为，把注释与未知项都保留下来
+    for (const line of allLines) {
+      if (!line.trim() || line.trimStart().startsWith("#")) {
+        extras.push(line);
+        continue;
+      }
+      const separatorIndex = line.indexOf("=");
+      if (separatorIndex === -1) {
+        extras.push(line);
+        continue;
+      }
+      const key = line.slice(0, separatorIndex).trim();
+      if (ALL_ENV_KEYS.includes(key)) {
+        readKeyValue(line);
+      } else {
+        extras.push(line);
+      }
     }
+  } else {
+    // 已保存过：标记之前只读配置项，注释/空行一律丢弃（它们由 buildEnvContent 重新生成）
+    for (const line of allLines.slice(0, markerIndex)) {
+      if (!line.trim() || line.trimStart().startsWith("#")) continue;
+      readKeyValue(line);
+    }
+    extras.push(...allLines.slice(markerIndex + 1));
   }
 
   return { values, extraContent: extras.join("\n").trim() };
@@ -127,7 +152,7 @@ function buildEnvContent(values: Record<string, string>, extraContent: string) {
 
   const extra = extraContent.trim();
   if (extra) {
-    lines.push("# 其他原始配置");
+    lines.push(EXTRA_MARKER);
     lines.push(extra);
   }
 
