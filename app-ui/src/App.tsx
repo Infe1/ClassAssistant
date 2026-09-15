@@ -167,7 +167,8 @@ function MainApp() {
       await stopBrowserAsrSession();
       const res = await stopMonitorWithSummary();
       disconnect();
-      setIsMonitoring(false);
+      dismissAlert();          // 必须清除警报状态：disconnect() 不会重置 alertActive，
+      setIsMonitoring(false);  // 否则停止监听后警报弹层会残留在屏幕上。
       setIsPaused(false);
       setAlertSuspended(false);
       setActiveCourseName("");
@@ -195,7 +196,7 @@ function MainApp() {
     } finally {
       setIsLoading(false);
     }
-  }, [disconnect, addToast, stopBrowserAsrSession]);
+  }, [disconnect, dismissAlert, addToast, stopBrowserAsrSession]);
 
   const handleOpenStartMonitor = useCallback(() => {
     setShowStartMonitorPanel(true);

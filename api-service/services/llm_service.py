@@ -15,6 +15,44 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# 课后总结的 max_tokens 配置。
+# 思考型模型会先产出思维链（reasoning_content），正文在思维链之后；额度不足时
+# 正文会被挤成空字符串（表现为 0 字节的总结文件）。实测 20095 字转录下：
+# 4000 时 5 次有 3 次正文为空，20000 稳定成功。
+DEFAULT_SUMMARY_MAX_TOKENS = 20000
+SUMMARY_MAX_TOKENS_FLOOR = 2000      # 低于此值思考型模型必然截断
+SUMMARY_MAX_TOKENS_CEILING = 64000   # 成本/延迟护栏，防止误填超大值
+
+
+def resolve_summary_max_tokens() -> int:
+    """读取 SUMMARY_MAX_TOKENS，带上下界校验与日志。
+
+    每次调用都重新读取环境变量，因此在设置面板保存后无需重启即可生效。
+    """
+    raw = os.getenv("SUMMARY_MAX_TOKENS", "")
+    if not raw or not str(raw).strip():
+        return DEFAULT_SUMMARY_MAX_TOKENS
+
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("SUMMARY_MAX_TOKENS=%r 非法，回退默认值 %d", raw, DEFAULT_SUMMARY_MAX_TOKENS)
+        return DEFAULT_SUMMARY_MAX_TOKENS
+
+    if value < SUMMARY_MAX_TOKENS_FLOOR:
+        logger.warning(
+            "SUMMARY_MAX_TOKENS=%d 过小，已抬升到 %d（低于该值思考型模型的正文会被挤空）",
+            value, SUMMARY_MAX_TOKENS_FLOOR,
+        )
+        return SUMMARY_MAX_TOKENS_FLOOR
+    if value > SUMMARY_MAX_TOKENS_CEILING:
+        logger.warning(
+            "SUMMARY_MAX_TOKENS=%d 过大，已钳制到 %d（成本与延迟护栏）",
+            value, SUMMARY_MAX_TOKENS_CEILING,
+        )
+        return SUMMARY_MAX_TOKENS_CEILING
+    return value
+
 
 class LLMService:
     """大语言模型调用服务 - 兼容 OpenAI API"""
@@ -351,12 +389,9 @@ class LLMService:
         # 思考型模型（如 deepseek-v4-flash-0731）会先产出很长的思维链（reasoning_content），
         # 正文（content）在思维链之后。若 max_tokens 太小，思维链会把额度吃光，
         # 导致 content 为空字符串——这正是"0 KB 总结文件"的根因。
-        # 实测（20095 字真实转录）：4000 必炸（正文 0 字），20000 稳定成功。
-        # 默认 20000，并允许用 .env 里的 SUMMARY_MAX_TOKENS 覆盖，无需再改代码。
-        try:
-            summary_max_tokens = int(os.getenv("SUMMARY_MAX_TOKENS", "20000"))
-        except ValueError:
-            summary_max_tokens = 20000
+        # 默认 20000，并允许用 .env 里的 SUMMARY_MAX_TOKENS 覆盖（带上下界校验），
+        # 每次调用重新读取，改完即生效、无需改代码。
+        summary_max_tokens = resolve_summary_max_tokens()
 
         try:
             response = await self.client.chat.completions.create(

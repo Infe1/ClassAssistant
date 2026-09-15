@@ -40,7 +40,7 @@ release/
 *.zip
 
 # ---- 构建产物（补充）----
-build/
+/build/
 winasr/obj/
 winasr/publish/
 app-ui/src-tauri/gen/

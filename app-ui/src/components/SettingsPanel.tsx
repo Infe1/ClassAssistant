@@ -80,6 +80,7 @@ const ENV_SECTIONS: Array<{ title: string; fields: EnvFieldConfig[] }> = [
 ];
 
 const ALL_ENV_KEYS = ENV_SECTIONS.flatMap((section) => section.fields.map((field) => field.key));
+const KNOWN_ENV_KEYS = new Set(ALL_ENV_KEYS);
 
 function createEmptyEnvValues() {
   return Object.fromEntries(ALL_ENV_KEYS.map((key) => [key, ""])) as Record<string, string>;
@@ -95,14 +96,26 @@ function parseEnvContent(content: string) {
   // buildEnvContent 生成的文件里，本身带有自动生成的章节标题和「# 其他原始配置」标记。
   // 若把这些行也当成"原始配置"收集，就会每保存一次多叠一层（历史 bug）。
   // 因此以标记为界：标记之后的内容才是需要原样保留的原始配置。
-  const markerIndex = allLines.findIndex((line) => line.trim() === EXTRA_MARKER);
+  // 取【最后一个】标记：历史文件可能因旧 bug 残留多个标记，取第一个会让多余的标记
+  // 被当作原始配置一直保留下去；取最后一个可顺便把旧标记清理掉。
+  let markerIndex = -1;
+  for (let i = allLines.length - 1; i >= 0; i -= 1) {
+    if (allLines[i].trim() === EXTRA_MARKER) {
+      markerIndex = i;
+      break;
+    }
+  }
 
   const readKeyValue = (line: string) => {
     const separatorIndex = line.indexOf("=");
     if (separatorIndex === -1) return;
     const key = line.slice(0, separatorIndex).trim();
-    if (!ALL_ENV_KEYS.includes(key)) return;
+    if (!KNOWN_ENV_KEYS.has(key)) return;
     const value = line.slice(separatorIndex + 1);
+    // 同一 key 出现多次时后值覆盖前值：提示一下，避免用户手写的配置被静默丢弃。
+    if (values[key]) {
+      console.warn(`[设置] .env 中 ${key} 重复出现，将采用后出现的值`);
+    }
     values[key] = key === "ASR_MODE" && value.trim() === "windows" ? "winasr" : value;
   };
 
@@ -119,7 +132,7 @@ function parseEnvContent(content: string) {
         continue;
       }
       const key = line.slice(0, separatorIndex).trim();
-      if (ALL_ENV_KEYS.includes(key)) {
+      if (KNOWN_ENV_KEYS.has(key)) {
         readKeyValue(line);
       } else {
         extras.push(line);
