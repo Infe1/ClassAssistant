@@ -44,3 +44,6 @@ release/
 winasr/obj/
 winasr/publish/
 app-ui/src-tauri/gen/
+
+# ---- 本地工具工作目录（含个人环境信息，勿提交）----
+.workbuddy-ai/

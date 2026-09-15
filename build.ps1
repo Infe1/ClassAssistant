@@ -1,11 +1,19 @@
 # ==========================================
 #   课狐 ClassFox - 一键打包脚本
-#   用法: .\build.ps1 <版本号>
-#   示例: .\build.ps1 v1.2.0
+#   用法: .\build.ps1 [版本号]
+#   版本号统一来源: app-ui\package.json
+#     - 不传参 → 直接使用 package.json 里的 version
+#     - 传参   → 以参数为准，并写回 package.json
+#   示例: .\build.ps1          (用 package.json 的版本)
+#         .\build.ps1 v2.0.3   (指定版本)
+#   版本号规则:
+#     第三位 = 修 bug          例 2.0.2 -> 2.0.3
+#     第二位 = 功能优化完善     例 2.0.3 -> 2.1.0
+#     第一位 = 大功能新增       例 2.1.0 -> 3.0.0
 # ==========================================
 
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Mandatory = $false, Position = 0)]
     [string]$Version
 )
 
@@ -17,12 +25,18 @@ $VENV_DIR = Join-Path $PSScriptRoot "api-service\.venv"
 $VENV_PYINSTALLER = Join-Path $VENV_DIR "Scripts\pyinstaller.exe"
 # --------------------------------------
 
-$VER_NUM = $Version -replace '^[vV]', ''
 $ROOT = $PSScriptRoot
 $API_DIR = Join-Path $ROOT "api-service"
 $UI_DIR = Join-Path $ROOT "app-ui"
 $RELEASE_DIR = Join-Path $ROOT "release"
-$DIST_NAME = "ClassFox-$Version-win-x64"
+
+# ---------- 版本号：唯一来源 = app-ui/package.json ----------
+# 不传参数时自动读取；传参则以参数为准并写回 package.json
+$PKG_PATH = Join-Path $UI_DIR "package.json"
+$PKG_VERSION = ([IO.File]::ReadAllText($PKG_PATH) | ConvertFrom-Json).version
+if (-not $Version) { $Version = $PKG_VERSION }
+$VER_NUM = $Version -replace '^[vV]', ''
+$DIST_NAME = "ClassFox-v$VER_NUM-win-x64"
 
 $tauriConfigPath = Join-Path $UI_DIR "src-tauri\tauri.conf.json"
 $tauriConfig = [IO.File]::ReadAllText($tauriConfigPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -36,21 +50,21 @@ Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ================================================
-# [1/6] 更新版本号
+# [1/6] 同步版本号
+#   唯一版本源 = app-ui/package.json
+#   tauri.conf.json 已改为引用 "../package.json"，不再改写
+#   Cargo.toml 因 Cargo 不支持外部引用，必须内联同步
 # ================================================
-Write-Host "[1/6] 更新版本号为 $VER_NUM ..." -ForegroundColor Yellow
+Write-Host "[1/6] 版本号 $VER_NUM ..." -ForegroundColor Yellow
 
-# tauri.conf.json
-$file = Join-Path $UI_DIR "src-tauri\tauri.conf.json"
-$content = [IO.File]::ReadAllText($file)
-$content = $content -replace '"version":\s*"[^"]+"', "`"version`": `"$VER_NUM`""
-[IO.File]::WriteAllText($file, $content)
-
-# package.json
-$file = Join-Path $UI_DIR "package.json"
-$content = [IO.File]::ReadAllText($file)
-$content = $content -replace '"version":\s*"[^"]+"', "`"version`": `"$VER_NUM`""
-[IO.File]::WriteAllText($file, $content)
+if ($PKG_VERSION -ne $VER_NUM) {
+    $content = [IO.File]::ReadAllText($PKG_PATH)
+    $content = $content -replace '"version":\s*"[^"]+"', "`"version`": `"$VER_NUM`""
+    [IO.File]::WriteAllText($PKG_PATH, $content)
+    Write-Host "      package.json: $PKG_VERSION -> $VER_NUM" -ForegroundColor Green
+} else {
+    Write-Host "      package.json 已是 $VER_NUM (版本源)" -ForegroundColor Green
+}
 
 # Cargo.toml（仅替换 [package] 下的 version）
 $file = Join-Path $UI_DIR "src-tauri\Cargo.toml"
@@ -58,7 +72,7 @@ $content = [IO.File]::ReadAllText($file)
 $content = $content -replace '(?m)^version\s*=\s*"[^"]+"', "version = `"$VER_NUM`""
 [IO.File]::WriteAllText($file, $content)
 
-Write-Host "      version updated" -ForegroundColor Green
+Write-Host "      Cargo.toml synced" -ForegroundColor Green
 
 # ================================================
 # [2/6] 打包后端（PyInstaller + .venv）
