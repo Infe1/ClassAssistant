@@ -15,6 +15,44 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# 课后总结的 max_tokens 配置。
+# 思考型模型会先产出思维链（reasoning_content），正文在思维链之后；额度不足时
+# 正文会被挤成空字符串（表现为 0 字节的总结文件）。实测 20095 字转录下：
+# 4000 时 5 次有 3 次正文为空，20000 稳定成功。
+DEFAULT_SUMMARY_MAX_TOKENS = 20000
+SUMMARY_MAX_TOKENS_FLOOR = 2000      # 低于此值思考型模型必然截断
+SUMMARY_MAX_TOKENS_CEILING = 64000   # 成本/延迟护栏，防止误填超大值
+
+
+def resolve_summary_max_tokens() -> int:
+    """读取 SUMMARY_MAX_TOKENS，带上下界校验与日志。
+
+    每次调用都重新读取环境变量，因此在设置面板保存后无需重启即可生效。
+    """
+    raw = os.getenv("SUMMARY_MAX_TOKENS", "")
+    if not raw or not str(raw).strip():
+        return DEFAULT_SUMMARY_MAX_TOKENS
+
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("SUMMARY_MAX_TOKENS=%r 非法，回退默认值 %d", raw, DEFAULT_SUMMARY_MAX_TOKENS)
+        return DEFAULT_SUMMARY_MAX_TOKENS
+
+    if value < SUMMARY_MAX_TOKENS_FLOOR:
+        logger.warning(
+            "SUMMARY_MAX_TOKENS=%d 过小，已抬升到 %d（低于该值思考型模型的正文会被挤空）",
+            value, SUMMARY_MAX_TOKENS_FLOOR,
+        )
+        return SUMMARY_MAX_TOKENS_FLOOR
+    if value > SUMMARY_MAX_TOKENS_CEILING:
+        logger.warning(
+            "SUMMARY_MAX_TOKENS=%d 过大，已钳制到 %d（成本与延迟护栏）",
+            value, SUMMARY_MAX_TOKENS_CEILING,
+        )
+        return SUMMARY_MAX_TOKENS_CEILING
+    return value
+
 
 class LLMService:
     """大语言模型调用服务 - 兼容 OpenAI API"""
@@ -348,6 +386,13 @@ class LLMService:
 
 请生成课堂笔记。"""
 
+        # 思考型模型（如 deepseek-v4-flash-0731）会先产出很长的思维链（reasoning_content），
+        # 正文（content）在思维链之后。若 max_tokens 太小，思维链会把额度吃光，
+        # 导致 content 为空字符串——这正是"0 KB 总结文件"的根因。
+        # 默认 20000，并允许用 .env 里的 SUMMARY_MAX_TOKENS 覆盖（带上下界校验），
+        # 每次调用重新读取，改完即生效、无需改代码。
+        summary_max_tokens = resolve_summary_max_tokens()
+
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -356,12 +401,35 @@ class LLMService:
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.5,
-                max_tokens=4000,
+                max_tokens=summary_max_tokens,
             )
-            return response.choices[0].message.content.strip()
-
         except Exception as e:
-            return f"# ⚠️ 总结生成失败\n\n错误信息: {str(e)}\n\n请检查 LLM API 配置。"
+            # 网络/鉴权/额度等调用失败：直接抛出去，绝不伪造成一份"笔记"。
+            raise RuntimeError(f"LLM 调用失败：{e}") from e
+
+        # 注意：以下解析与校验必须放在 try/except 之外。
+        # 之前把 raise 写在 try 内，会被下面自己的 except 吞掉，
+        # 变成一行"总结生成失败"字符串返回，反而写出假笔记（有内容但全是报错）。
+        choice = response.choices[0]
+        message = choice.message
+        content = (message.content or "").strip()
+
+        # 关键防线：绝不允许把空内容当作成功返回，否则会写出 0 字节的总结文件。
+        if not content:
+            reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+            if reasoning:
+                raise ValueError(
+                    f"LLM 只返回了思维链（{len(reasoning)} 字）而没有正文，"
+                    f"finish_reason={choice.finish_reason}。"
+                    "通常是因为 max_tokens 不足：请换用非思考型模型"
+                    "（如 deepseek-v4-pro）或调大 SUMMARY_MAX_TOKENS。"
+                )
+            raise ValueError(
+                f"LLM 返回了空内容（finish_reason={choice.finish_reason}），"
+                "请检查模型与 API 配置。"
+            )
+
+        return content
 
     async def compress_monitoring_progress(self, previous_summary: str, recent_lines: list[str]) -> str:
         """

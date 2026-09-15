@@ -187,3 +187,102 @@ body {
 .style-preview--slate {
 	background-image: radial-gradient(circle at top left, rgba(148, 163, 184, 0.18), transparent 34%), radial-gradient(circle at bottom right, rgba(99, 102, 241, 0.18), transparent 40%), linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(30, 41, 59, 0.94));
 }
+
+/* ===== 边角美术：四角描边 + 角落光晕 + 顶部流光 ===== */
+.corner-art {
+	position: absolute;
+	inset: 0;
+	z-index: 0;
+	overflow: hidden;
+	border-radius: inherit;
+	pointer-events: none;
+}
+
+/* 四角 L 形描边 */
+.corner-art .corner {
+	position: absolute;
+	width: 16px;
+	height: 16px;
+	border-style: solid;
+	border-color: var(--theme-primary-border);
+	opacity: 0.7;
+	transition: opacity 0.35s ease, border-color 0.35s ease;
+}
+
+.corner-art .corner--tl {
+	top: 4px;
+	left: 4px;
+	border-width: 1.5px 0 0 1.5px;
+	border-top-left-radius: 7px;
+}
+
+.corner-art .corner--tr {
+	top: 4px;
+	right: 4px;
+	border-width: 1.5px 1.5px 0 0;
+	border-top-right-radius: 7px;
+}
+
+.corner-art .corner--bl {
+	bottom: 4px;
+	left: 4px;
+	border-width: 0 0 1.5px 1.5px;
+	border-bottom-left-radius: 7px;
+}
+
+.corner-art .corner--br {
+	bottom: 4px;
+	right: 4px;
+	border-width: 0 1.5px 1.5px 0;
+	border-bottom-right-radius: 7px;
+}
+
+/* 左上 / 右下 角落光晕 */
+.corner-art::before,
+.corner-art::after {
+	content: "";
+	position: absolute;
+	border-radius: 999px;
+	background: radial-gradient(circle, var(--theme-primary-border), transparent 70%);
+	filter: blur(7px);
+}
+
+.corner-art::before {
+	top: -46px;
+	left: -46px;
+	width: 132px;
+	height: 132px;
+	opacity: 0.5;
+}
+
+.corner-art::after {
+	right: -50px;
+	bottom: -50px;
+	width: 144px;
+	height: 144px;
+	opacity: 0.34;
+}
+
+/* 顶部流光 */
+.corner-art .corner-sheen {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 1px;
+	background: linear-gradient(90deg, transparent, var(--theme-primary-border), transparent);
+	opacity: 0.75;
+	animation: cornerSheen 5s ease-in-out infinite;
+}
+
+@keyframes cornerSheen {
+	0%,
+	100% {
+		transform: translateX(-35%);
+		opacity: 0.3;
+	}
+	50% {
+		transform: translateX(35%);
+		opacity: 0.9;
+	}
+}

@@ -40,6 +40,13 @@ class SummaryService:
             material=class_material,
         )
 
+        # 兜底防线：即使 LLM 服务出现意外，也绝不允许写出 0 字节的总结文件。
+        if not summary_md or not summary_md.strip():
+            raise ValueError(
+                "LLM 返回了空内容，未生成总结文件。"
+                "请检查模型是否可用（思考型模型可能需要更大的 SUMMARY_MAX_TOKENS）。"
+            )
+
         summaries_dir = os.path.join(DATA_DIR, "summaries")
         os.makedirs(summaries_dir, exist_ok=True)
 
