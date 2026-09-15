@@ -118,24 +118,24 @@ export default function InlineAIChat({ visible, mode }: InlineAIChatProps) {
         </button>
       </div>
 
-      {loading && <div className="mb-2 text-xs text-white/60">正在加载 AI 上下文...</div>}
-      {error && <div className="mb-2 rounded-lg border border-red-500/30 bg-red-500/12 px-2 py-1 text-xs text-red-200">{error}</div>}
-
-      {!loading && mode === "catchup" && summary && (
-        <div className="mb-2 rounded-xl border border-indigo-400/20 bg-indigo-500/10 p-2">
-          <MarkdownRenderer content={summary} />
-        </div>
-      )}
-
-      {!loading && mode === "rescue" && rescueSeed && (
-        <div className="mb-2 rounded-xl border border-emerald-400/20 bg-emerald-500/10 p-2">
-          <MarkdownRenderer
-            content={`**课堂上下文**\n${rescueSeed.context}\n\n**老师问题**\n${rescueSeed.question}\n\n**建议答案**\n${rescueSeed.answer}`}
-          />
-        </div>
-      )}
+      {loading && <div className="mb-2 shrink-0 text-xs text-white/60">正在加载 AI 上下文...</div>}
+      {error && <div className="mb-2 shrink-0 rounded-lg border border-red-500/30 bg-red-500/12 px-2 py-1 text-xs text-red-200">{error}</div>}
 
       <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/10 bg-black/20 p-2">
+        {!loading && mode === "catchup" && summary && (
+          <div className="mb-2 rounded-xl border border-indigo-400/20 bg-indigo-500/10 p-2">
+            <MarkdownRenderer content={summary} />
+          </div>
+        )}
+
+        {!loading && mode === "rescue" && rescueSeed && (
+          <div className="mb-2 rounded-xl border border-emerald-400/20 bg-emerald-500/10 p-2">
+            <MarkdownRenderer
+              content={`**课堂上下文**\n${rescueSeed.context}\n\n**老师问题**\n${rescueSeed.question}\n\n**建议答案**\n${rescueSeed.answer}`}
+            />
+          </div>
+        )}
+
         {messages.length === 0 ? (
           <div className="text-xs text-white/45">可以开始追问，回答支持 Markdown 与公式渲染。</div>
         ) : (
@@ -157,7 +157,7 @@ export default function InlineAIChat({ visible, mode }: InlineAIChatProps) {
         )}
       </div>
 
-      <div className="mt-2 flex items-stretch gap-2">
+      <div className="mt-2 flex shrink-0 items-stretch gap-2">
         <textarea
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
