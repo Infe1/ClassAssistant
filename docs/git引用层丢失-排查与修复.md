@@ -125,10 +125,30 @@ ordered = sorted(refs.items(), key=lambda kv: kv[0].split("/"))
 
 ### 核心不变量
 
-**`packed-refs` 的内容始终是准确的，fetch / push 都不会破坏它。**
-唯一缺失的是松散层文件。
+**唯一可靠的权威来源是 reflog**（`.git/logs/`）。松散层与 `packed-refs`
+都是**不可靠的缓存**：
 
-因此修复**不需要回写 `packed-refs`**，只需把松散层补齐到与 packed 层同构。
+| 层 | 可靠性 | 表现 |
+| ------ | ------ | ------ |
+| reflog (`.git/logs/`) | ✅ **权威** | 写盘从未失败，push/fetch 后立即反映最新值 |
+| 松散层 (`.git/refs/`) | ⚠️ 会被 fetch 清空 | 清空后触发目录级短路 |
+| `packed-refs` | ⚠️ 会**滞后** | push 后仍停留在旧值，不随 push 更新 |
+
+实测（2026-09-23，push `cb7ad29..04fce6b` 之后）：
+
+```
+HEAD:              04fce6b   ✅
+松散 origin-ssh:   04fce6b   ✅
+reflog:            04fce6b   ✅
+远端:              04fce6b   ✅
+packed origin-ssh: cb7ad29   ❌ 滞后一个提交
+```
+
+> 先前"`packed-refs` 始终准确"的结论是**误判**——当时恰好对同一 commit
+> 反复操作，掩盖了滞后。以 reflog 为准才是正确做法。
+
+因此修复**不回写 `packed-refs`**（避免在滞后值上做无谓写入），
+只把松散层补齐到与**reflog** 一致。
 
 ### 权威值来源（优先级）
 
@@ -172,7 +192,8 @@ python tools/refs-doctor.py --check    # 只检查（有问题退出码 1）
 | `git refs-fix --check` | `正常：22 条松散引用与 reflog / packed-refs 一致` ✅ |
 | 连续 3 轮裸 fetch | 逐轮复现 `[gone]`（**证实必须包装**）✅ |
 | `git fetch-checkout` 包装命令 | fetch + 修复一步到位，无 `[gone]` ✅ |
-| 四方 SHA 一致 | HEAD = `origin-ssh/main`(松散) = `origin-ssh/main`(packed) = reflog = `cb7ad29` ✅ |
+| 四方 SHA 一致 | HEAD = `origin-ssh/main`(松散) = reflog = 远端 = `04fce6b` ✅ |
+| `packed-refs` 滞后 | push 后仍为 `cb7ad29`（**证实不可作权威源**）⚠️ |
 | 松散层同构 | `origin`(5) · `origin-ssh`(5) · `pr`(4) · `upstream`(3) ✅ |
 
 ## 七、未验证 / 已知限制

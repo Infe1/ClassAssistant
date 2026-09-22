@@ -28,8 +28,12 @@ git for-each-ref refs/remotes/origin-ssh    ❌ 0 条
 本仓库四个远端目录中，只有 `origin-ssh` 的松散层与 packed 层不同构（0 vs 5），
 其余三个恰好完全一致，所以只有它显形。
 
-> **关键不变量**：`packed-refs` 的内容始终准确，fetch / push 都不破坏它。
-> 缺的只有松散层文件，所以修复**不需要回写 packed-refs**。
+> **关键不变量**：唯一可靠的是 **reflog**（`.git/logs/`）。松散层会被 fetch
+> 清空，`packed-refs` 会**滞后**（push 后仍停留在旧值）。因此修复只把松散层
+> 对齐到 reflog，不碰 `packed-refs`。
+>
+> 实测：push `cb7ad29..04fce6b` 后，松散/reflog/远端均为 `04fce6b`，
+> 而 `packed-refs` 仍是 `cb7ad29`。
 
 ### 用法
 
@@ -58,8 +62,8 @@ git config alias.pullfix        "!git pull \"\$@\" && $PY .git/hooks/refs-doctor
 
 ### 原理
 
-按 `packed-refs` 中 `refs/remotes/*` 与 `refs/heads/*` 的每一条，
-在松散层写出对应文件（值取 reflog 优先、packed-refs 兜底），
-把松散层补齐到与 packed 层**同构**。幂等、无损、不删任何东西。
+按 `packed-refs` 中 `refs/remotes/*` 与 `refs/heads/*` 的**引用清单**，
+在松散层写出对应文件，值取 **reflog 优先**（权威）、`packed-refs` 兜底
+（packed 会滞后，仅用于 reflog 缺失时）。幂等、无损、不删任何东西。
 
 详细排查过程见 [`../docs/git引用层丢失-排查与修复.md`](../docs/git引用层丢失-排查与修复.md)。

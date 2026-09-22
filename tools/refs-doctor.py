@@ -54,14 +54,22 @@ Git 的引用数据库有两层存储：
 
 不变量
 ------
-`packed-refs` 的内容**始终是准确的**，fetch / push 都不会破坏它。
-唯一缺失的是宽松层文件。因此本脚本**不需要回写 packed-refs**，
-只需把松散层补齐到与 packed 层同构。
+唯一可靠的是 **reflog**（`.git/logs/refs/...`），它写盘从未失败且能反映
+最新 push。另外两层都是不可靠的缓存：
+
+    松散层    ⚠️ 会被 fetch 清空（本工具要修的就是它）
+    packed-refs ⚠️ 会滞后 —— push 之后仍停留在旧值
+
+实测：push cb7ad29..04fce6b 后，松散 / reflog / 远端均为 04fce6b，
+而 packed-refs 里还是 cb7ad29。
+
+因此本工具**不回写 packed-refs**（在滞后的值上写入没有意义），
+只把松散层补齐到与 reflog 一致。
 
 权威值来源（优先级）
 --------------------
-1. `.git/logs/refs/...` reflog 最后一行新值（reflog 一直写盘正常，且能反映最新 push）
-2. `packed-refs`（reflog 缺失时兜底）
+1. `.git/logs/refs/...` reflog 最后一行新值 —— **权威**
+2. `packed-refs` —— 仅在 reflog 缺失时兜底
 
 方案
 ----
@@ -141,7 +149,11 @@ def reflog_tip(refname: str) -> str | None:
 
 
 def desired() -> dict[str, str]:
-    """松散层应当存在的引用 → 最新值（reflog 优先于 packed-refs）"""
+    """松散层应当存在的引用 → 最新值（reflog 优先于 packed-refs）
+
+    注意：packed-refs 只用来提供**引用清单**（哪些 ref 应该有松散文件），
+    它给出的值会滞后，必须让 reflog 覆盖。
+    """
     wanted = {ref: sha for ref, sha in load_packed().items()
               if ref.startswith(SCOPES)}
 
