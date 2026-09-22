@@ -23,6 +23,41 @@ DEFAULT_SUMMARY_MAX_TOKENS = 20000
 SUMMARY_MAX_TOKENS_FLOOR = 2000      # 低于此值思考型模型必然截断
 SUMMARY_MAX_TOKENS_CEILING = 64000   # 成本/延迟护栏，防止误填超大值
 
+# LLM 请求超时（秒）。openai SDK 默认 600 秒，对课堂场景过长：
+# 一次悬停的追问会让前端「AI 思考中」卡 10 分钟，用户只能重启。
+# 可用 LLM_TIMEOUT 覆盖，允许小数（如 12.5）。注意该值是「单请求总时长」，
+# 课后总结在长转录 + 思考型模型下确实可能跑很久，故默认给得偏宽松。
+DEFAULT_LLM_TIMEOUT = 60.0
+LLM_TIMEOUT_FLOOR = 5.0
+LLM_TIMEOUT_CEILING = 600.0
+
+
+def resolve_llm_timeout() -> float:
+    """读取 LLM_TIMEOUT，带上下界校验与日志。非法值回退默认。"""
+    raw = os.getenv("LLM_TIMEOUT", "")
+    if not raw or not str(raw).strip():
+        return DEFAULT_LLM_TIMEOUT
+
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("LLM_TIMEOUT=%r 非法，回退默认值 %.0f 秒", raw, DEFAULT_LLM_TIMEOUT)
+        return DEFAULT_LLM_TIMEOUT
+
+    if value < LLM_TIMEOUT_FLOOR:
+        logger.warning(
+            "LLM_TIMEOUT=%.1f 过小，已抬升到 %.1f 秒（低于该值正常请求也会被掐断）",
+            value, LLM_TIMEOUT_FLOOR,
+        )
+        return LLM_TIMEOUT_FLOOR
+    if value > LLM_TIMEOUT_CEILING:
+        logger.warning(
+            "LLM_TIMEOUT=%.1f 过大，已钳制到 %.1f 秒（护栏）",
+            value, LLM_TIMEOUT_CEILING,
+        )
+        return LLM_TIMEOUT_CEILING
+    return value
+
 
 def resolve_summary_max_tokens() -> int:
     """读取 SUMMARY_MAX_TOKENS，带上下界校验与日志。
@@ -64,11 +99,99 @@ class LLMService:
         self.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
         # 初始化异步客户端
+        # timeout: 收窄 SDK 默认的 600 秒；max_retries=0 让我们自己控制重试次数，
+        # 避免「超时 → 内置重试 → 再等一个超时」把卡顿放大数倍。
         self.client = AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
+            timeout=resolve_llm_timeout(),
+            max_retries=0,
         )
         self.prompt_service = PromptService()
+
+    # ------------------------------------------------------------------
+    # 调用入口：统一记录 prompt 缓存命中情况
+    # ------------------------------------------------------------------
+    def _log_cache_usage(self, response, tag: str) -> None:
+        """记录本次请求的 prompt 缓存命中量。
+
+        各家服务商上报缓存的字段不同，这里做兼容读取：
+          - DeepSeek: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+          - OpenAI:   usage.prompt_tokens_details.cached_tokens
+        都没有该字段时静默跳过（不支持的厂商不影响正常流程）。
+
+        用途：判断「把不变内容放在 messages 头部」的前缀缓存策略是否真的生效。
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+
+        hit = getattr(usage, "prompt_cache_hit_tokens", None)
+        if hit is None:
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                hit = getattr(details, "cached_tokens", None)
+        if hit is None:
+            return
+
+        hit = int(hit or 0)
+        percent = (hit / prompt_tokens * 100) if prompt_tokens else 0.0
+        logger.info(
+            "[LLM缓存] %s | 命中 %d / 输入 %d (%.1f%%)",
+            tag, hit, prompt_tokens, percent,
+        )
+
+    async def _chat(self, tag: str, **kwargs):
+        """所有 LLM 请求的统一入口，自动附带缓存命中日志。"""
+        response = await self.client.chat.completions.create(**kwargs)
+        self._log_cache_usage(response, tag)
+        return response
+
+    # ------------------------------------------------------------------
+    # 回复抽取：区分「真·空回复」与「工具调用回复」
+    # ------------------------------------------------------------------
+    def _extract_text(self, response, tag: str) -> str:
+        """从响应中取出正文，并把空回复的原因写进日志。
+
+        为什么需要单独一层：调用方普遍写成
+            content = (response.choices[0].message.content or "").strip()
+        一旦 content 是 None/空串，`or "当前没有可用回答。"` 就会把它兜住，
+        界面只显示一句无信息量的文案，日志里却什么都没有 —— 线上极难定位。
+
+        实际有三种互不相同的情况：
+          1. 正常文本回复                     → 返回正文
+          2. 模型返回了 tool_calls 而没给正文 → 本服务未实现工具执行，属配置问题
+          3. 真的什么都没返回                 → 通常是拒答 / finish_reason=length
+        """
+        message = response.choices[0].message
+        content = (message.content or "").strip()
+        if content:
+            return content
+
+        choice = response.choices[0]
+        tool_calls = getattr(message, "tool_calls", None)
+        reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+
+        if tool_calls:
+            logger.error(
+                "[LLM空回复] %s | 模型返回了 %d 个 tool_calls 但没有正文，"
+                "本服务未实现工具执行。请改用非 Agent 型模型（如 deepseek-chat）",
+                tag, len(tool_calls),
+            )
+        elif reasoning:
+            logger.error(
+                "[LLM空回复] %s | 只返回了思维链（%d 字），正文为空，"
+                "finish_reason=%s。通常是 max_tokens 不足",
+                tag, len(reasoning), choice.finish_reason,
+            )
+        else:
+            logger.error(
+                "[LLM空回复] %s | 正文为空且无思维链，finish_reason=%s",
+                tag, choice.finish_reason,
+            )
+        return ""
 
     async def analyze_rescue(
         self,
@@ -107,16 +230,20 @@ class LLMService:
             prompt_override=prompt_override,
         )
 
-        user_prompt = f"""【课堂录音转录（最近2分钟）】
-{transcript}
-
-【课程资料（PPT内容）】
+        # 顺序说明：把整节课不变的「课程资料」放在最前、每次都变的「转录」放后面，
+        # 使 system_prompt + 课程资料 构成稳定前缀，命中服务端 prompt 前缀缓存
+        # （DeepSeek 命中价约为未命中的 1/10）。语义与原先一致，仅调整段落顺序。
+        user_prompt = f"""【课程资料（PPT内容）】
 {material if material else "暂无课程资料"}
+
+【课堂录音转录（最近2分钟）】
+{transcript}
 
 请分析并提取问题和答案。"""
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "analyze_rescue",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -183,16 +310,17 @@ class LLMService:
             prompt_override=prompt_override,
         )
 
-        user_prompt = f"""【课堂录音转录】
-{transcript}
-
-【课程资料（PPT内容）】
+        user_prompt = f"""【课程资料（PPT内容）】
 {material if material else "暂无课程资料"}
+
+【课堂录音转录】
+{transcript}
 
 请总结老师讲到哪了。"""
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "analyze_catchup",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -238,14 +366,14 @@ class LLMService:
             prompt_override=prompt_override,
         )
 
-        user_prompt = f"""【当前课堂进度摘要】
+        user_prompt = f"""【课程资料】
+{material if material else '暂无课程资料'}
+
+【当前课堂进度摘要】
 {summary}
 
 【最近课堂转录】
 {transcript}
-
-【课程资料】
-{material if material else '暂无课程资料'}
 
 【已有追问历史】
 {history_text}
@@ -256,7 +384,8 @@ class LLMService:
 请直接回答学生。"""
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "answer_catchup_question",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -265,9 +394,15 @@ class LLMService:
                 temperature=0.4,
                 max_tokens=800,
             )
-            content = (response.choices[0].message.content or "").strip()
-            return {"answer": content or "当前没有可用回答。"}
+            content = self._extract_text(response, "answer_catchup_question")
+            if not content:
+                return {
+                    "answer": "模型本次没有返回内容（已记录到后端日志）。"
+                              "请再试一次；若持续如此，请在设置里更换模型。"
+                }
+            return {"answer": content}
         except Exception as exc:
+            logger.exception("[LLM调用失败] answer_catchup_question")
             return {"answer": f"LLM 调用失败: {exc}，请检查 API 配置"}
 
     async def answer_rescue_question(
@@ -304,7 +439,10 @@ class LLMService:
             prompt_override=prompt_override,
         )
 
-        user_prompt = f"""【课堂上下文】
+        user_prompt = f"""【课程资料】
+{material if material else '暂无课程资料'}
+
+【课堂上下文】
 {context}
 
 【识别到的老师问题】
@@ -316,9 +454,6 @@ class LLMService:
 【最近课堂转录】
 {transcript}
 
-【课程资料】
-{material if material else '暂无课程资料'}
-
 【已有追问历史】
 {history_text}
 
@@ -328,7 +463,8 @@ class LLMService:
 请直接回答学生。"""
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "answer_rescue_question",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -337,9 +473,15 @@ class LLMService:
                 temperature=0.4,
                 max_tokens=800,
             )
-            content = (response.choices[0].message.content or "").strip()
-            return {"answer": content or "当前没有可用回答。"}
+            content = self._extract_text(response, "answer_rescue_question")
+            if not content:
+                return {
+                    "answer": "模型本次没有返回内容（已记录到后端日志）。"
+                              "请再试一次；若持续如此，请在设置里更换模型。"
+                }
+            return {"answer": content}
         except Exception as exc:
+            logger.exception("[LLM调用失败] answer_rescue_question")
             return {"answer": f"LLM 调用失败: {exc}，请检查 API 配置"}
 
     async def generate_class_summary(self, transcript: str, material: str) -> str:
@@ -378,11 +520,11 @@ class LLMService:
 
 请确保笔记内容准确、条理清晰。"""
 
-        user_prompt = f"""【完整课堂转录】
-{transcript}
-
-【课程资料（PPT内容）】
+        user_prompt = f"""【课程资料（PPT内容）】
 {material if material else "暂无课程资料"}
+
+【完整课堂转录】
+{transcript}
 
 请生成课堂笔记。"""
 
@@ -394,7 +536,8 @@ class LLMService:
         summary_max_tokens = resolve_summary_max_tokens()
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "generate_class_summary",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -465,7 +608,8 @@ class LLMService:
 请输出新的滚动摘要。"""
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await self._chat(
+                "compress_monitoring_progress",
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},

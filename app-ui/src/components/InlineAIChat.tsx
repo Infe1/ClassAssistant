@@ -100,10 +100,21 @@ export default function InlineAIChat({ visible, mode }: InlineAIChatProps) {
         setMessages((prev) => [...prev, { role: "assistant", content: res.answer }]);
       }
     } catch (err) {
+      // 追问失败时把问题放回输入框：`asking` 已解锁，用户可以直接重发，
+      // 不必重新敲一遍（超时场景下这一点很关键）。
+      setQuestion(input);
       setError(err instanceof Error ? err.message : "追问失败");
     } finally {
       setAsking(false);
     }
+  };
+
+  /** 重试上一次提问：把问题填回输入框并立即重发。 */
+  const handleRetry = () => {
+    const lastUser = [...messages].reverse().find((item) => item.role === "user");
+    if (!lastUser) return;
+    setQuestion(lastUser.content);
+    setError(null);
   };
 
   return (
@@ -119,7 +130,19 @@ export default function InlineAIChat({ visible, mode }: InlineAIChatProps) {
       </div>
 
       {loading && <div className="mb-2 shrink-0 text-xs text-white/60">正在加载 AI 上下文...</div>}
-      {error && <div className="mb-2 shrink-0 rounded-lg border border-red-500/30 bg-red-500/12 px-2 py-1 text-xs text-red-200">{error}</div>}
+      {error && (
+        <div className="mb-2 flex shrink-0 items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/12 px-2 py-1 text-xs text-red-200">
+          <span className="min-w-0 flex-1 break-words">{error}</span>
+          {messages.length > 0 && (
+            <button
+              onClick={handleRetry}
+              className="shrink-0 rounded-md border border-red-400/30 bg-red-500/16 px-2 py-0.5 text-[11px] text-red-100 transition hover:bg-red-500/24"
+            >
+              重填
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-white/10 bg-black/20 p-2">
         {!loading && mode === "catchup" && summary && (

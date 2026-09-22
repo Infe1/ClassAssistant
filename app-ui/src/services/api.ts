@@ -8,6 +8,53 @@
 export const API_BASE = "http://127.0.0.1:8765/api";
 
 /**
+ * 默认请求超时（毫秒）。
+ *
+ * 为什么需要：`fetch` 本身没有超时。如果后端某一请求长时间不返回
+ * （例如 uvicorn 单 worker 被一个慢 LLM 调用占住，事件循环无法调度其他请求），
+ * 前端会永远停在「AI 思考中...」——按钮一直是 disabled，只能重启应用。
+ * 有了超时，至少会自动结束并给出可读的报错。
+ *
+ * 超时值选择：比后端 LLM 超时（默认 60 秒）留足余量，避免前端先于后端放弃。
+ */
+const DEFAULT_TIMEOUT_MS = 90_000;
+
+/** 课后总结可能很慢（长转录 + 思考型模型），单独放宽。 */
+const SUMMARY_TIMEOUT_MS = 180_000;
+
+function withTimeout(signal: AbortSignal | undefined, ms: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
+/** 统一的错误信息：把 AbortError 翻译成人话。 */
+function describeFailure(err: unknown, fallback: string): string {
+  if (err instanceof DOMException && err.name === "AbortError") {
+    return "请求超时：后端长时间未响应。请检查后端是否仍在运行，再重试一次。";
+  }
+  return err instanceof Error ? err.message : fallback;
+}
+
+/** 带超时的 fetch —— 所有后端请求都应经由它发出。 */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<Response> {
+  const { signal, clear } = withTimeout(init.signal ?? undefined, timeoutMs);
+  try {
+    return await fetchWithTimeout(url, { ...init, signal });
+  } finally {
+    clear();
+  }
+}
+
+/**
  * 上传 PPT 文件到后端进行解析
  */
 export async function uploadPPT(file: File): Promise<{
@@ -19,7 +66,7 @@ export async function uploadPPT(file: File): Promise<{
   const formData = new FormData();
   formData.append("file", file);
 
-  const res = await fetch(`${API_BASE}/upload_ppt`, {
+  const res = await fetchWithTimeout(`${API_BASE}/upload_ppt`, {
     method: "POST",
     body: formData,
   });
@@ -59,7 +106,7 @@ export interface StartMonitorResponse {
 export async function startMonitor(
   payload: StartMonitorPayload
 ): Promise<StartMonitorResponse> {
-  const res = await fetch(`${API_BASE}/start_monitor`, {
+  const res = await fetchWithTimeout(`${API_BASE}/start_monitor`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -76,25 +123,25 @@ export async function startMonitor(
  * 停止监控
  */
 export async function stopMonitor(): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/stop_monitor`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/stop_monitor`, { method: "POST" });
   if (!res.ok) throw new Error("停止监控失败");
   return res.json();
 }
 
 export async function pauseMonitor(): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/pause_monitor`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/pause_monitor`, { method: "POST" });
   if (!res.ok) throw new Error("暂停监控失败");
   return res.json();
 }
 
 export async function resumeMonitor(): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/resume_monitor`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/resume_monitor`, { method: "POST" });
   if (!res.ok) throw new Error("继续监控失败");
   return res.json();
 }
 
 export async function stopMonitorWithSummary(): Promise<StopMonitorResponse> {
-  const res = await fetch(`${API_BASE}/stop_monitor`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/stop_monitor`, { method: "POST" });
   if (!res.ok) throw new Error("停止监控失败");
   return res.json();
 }
@@ -108,7 +155,7 @@ export async function emergencyRescue(): Promise<{
   question: string;
   answer: string;
 }> {
-  const res = await fetch(`${API_BASE}/emergency_rescue`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/emergency_rescue`, { method: "POST" });
   if (!res.ok) throw new Error("救场请求失败");
   return res.json();
 }
@@ -122,7 +169,7 @@ export async function emergencyRescueWithPrompt(payload: {
   question: string;
   answer: string;
 }> {
-  const res = await fetch(`${API_BASE}/emergency_rescue`, {
+  const res = await fetchWithTimeout(`${API_BASE}/emergency_rescue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -143,10 +190,12 @@ export async function emergencyRescueChat(payload: {
   status: string;
   answer: string;
 }> {
-  const res = await fetch(`${API_BASE}/emergency_rescue_chat`, {
+  const res = await fetchWithTimeout(`${API_BASE}/emergency_rescue_chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  }).catch((err) => {
+    throw new Error(describeFailure(err, "救场追问失败"));
   });
   if (!res.ok) throw new Error("救场追问失败");
   return res.json();
@@ -160,7 +209,11 @@ export async function generateSummary(): Promise<{
   filename: string;
   summary: string;
 }> {
-  const res = await fetch(`${API_BASE}/generate_summary`, { method: "POST" });
+  const res = await fetchWithTimeout(
+    `${API_BASE}/generate_summary`,
+    { method: "POST" },
+    SUMMARY_TIMEOUT_MS
+  );
   if (!res.ok) throw new Error("生成总结失败");
   return res.json();
 }
@@ -172,7 +225,7 @@ export async function catchup(): Promise<{
   status: string;
   summary: string;
 }> {
-  const res = await fetch(`${API_BASE}/catchup`, { method: "POST" });
+  const res = await fetchWithTimeout(`${API_BASE}/catchup`, { method: "POST" });
   if (!res.ok) throw new Error("获取进度失败");
   return res.json();
 }
@@ -184,7 +237,7 @@ export async function catchupWithPrompt(payload: {
   status: string;
   summary: string;
 }> {
-  const res = await fetch(`${API_BASE}/catchup`, {
+  const res = await fetchWithTimeout(`${API_BASE}/catchup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -203,10 +256,12 @@ export async function catchupChat(payload: {
   status: string;
   answer: string;
 }> {
-  const res = await fetch(`${API_BASE}/catchup_chat`, {
+  const res = await fetchWithTimeout(`${API_BASE}/catchup_chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  }).catch((err) => {
+    throw new Error(describeFailure(err, "课堂追问失败"));
   });
   if (!res.ok) throw new Error("课堂追问失败");
   return res.json();
@@ -219,7 +274,7 @@ export async function updateKeywords(keywords: string[]): Promise<{
   status: string;
   all_keywords: string[];
 }> {
-  const res = await fetch(`${API_BASE}/update_keywords`, {
+  const res = await fetchWithTimeout(`${API_BASE}/update_keywords`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ keywords }),
@@ -236,7 +291,7 @@ export async function getKeywords(): Promise<{
   custom: string[];
   all: string[];
 }> {
-  const res = await fetch(`${API_BASE}/keywords`);
+  const res = await fetchWithTimeout(`${API_BASE}/keywords`);
   if (!res.ok) throw new Error("获取关键词失败");
   return res.json();
 }
@@ -245,7 +300,7 @@ export async function getCiteFiles(): Promise<{
   status: string;
   items: Array<{ filename: string; updated_at: string; size: number }>;
 }> {
-  const res = await fetch(`${API_BASE}/cite_files`);
+  const res = await fetchWithTimeout(`${API_BASE}/cite_files`);
   if (!res.ok) throw new Error("获取资料列表失败");
   return res.json();
 }
@@ -255,7 +310,7 @@ export async function getSettings(): Promise<{
   content: string;
   path: string;
 }> {
-  const res = await fetch(`${API_BASE}/settings`);
+  const res = await fetchWithTimeout(`${API_BASE}/settings`);
   if (!res.ok) throw new Error("读取设置失败");
   return res.json();
 }
@@ -264,7 +319,7 @@ export async function ingestAsrText(payload: {
   text: string;
   is_final?: boolean;
 }): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/ingest_asr_text`, {
+  const res = await fetchWithTimeout(`${API_BASE}/ingest_asr_text`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -290,7 +345,7 @@ export async function saveSettings(content: string): Promise<{
   status: string;
   message: string;
 }> {
-  const res = await fetch(`${API_BASE}/settings`, {
+  const res = await fetchWithTimeout(`${API_BASE}/settings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
@@ -322,7 +377,7 @@ export async function getPrompts(category?: string): Promise<PromptSnapshotRespo
   const url = category
     ? `${API_BASE}/prompts?category=${encodeURIComponent(category)}`
     : `${API_BASE}/prompts`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   if (!res.ok) throw new Error("获取提示词预设失败");
   return res.json();
 }
@@ -331,7 +386,7 @@ export async function selectPromptPreset(payload: {
   category: string;
   preset_id: string;
 }): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/prompts/select`, {
+  const res = await fetchWithTimeout(`${API_BASE}/prompts/select`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -347,7 +402,7 @@ export async function savePromptDraft(payload: {
   status: string;
   data: { category: string; content: string };
 }> {
-  const res = await fetch(`${API_BASE}/prompts/draft`, {
+  const res = await fetchWithTimeout(`${API_BASE}/prompts/draft`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -368,7 +423,7 @@ export async function getTranscriptSnapshot(sinceMtime?: number): Promise<{
   const url = sinceMtime
     ? `${API_BASE}/transcript_snapshot?since_mtime=${encodeURIComponent(String(sinceMtime))}`
     : `${API_BASE}/transcript_snapshot`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   if (!res.ok) throw new Error("获取转录快照失败");
   return res.json();
 }
