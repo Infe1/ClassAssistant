@@ -47,3 +47,12 @@ app-ui/src-tauri/gen/
 
 # ---- 本地工具工作目录（含个人环境信息，勿提交）----
 .workbuddy-ai/
+
+# ---- 本地调查/交接文档（用户决定不入库）----
+# 这些是过程中的分析记录，非项目代码或对外文档，保留在本地即可。
+docs/WorkBuddy-思维链档位-调查与方案.md
+docs/akurisu-改动说明-v2.0.1.md
+docs/code-review-PR4-v2.0.1.md
+docs/缓存优化-交接.md
+docs/tools/
+docs/workbuddy-reasoning-tools.7z
