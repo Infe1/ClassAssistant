@@ -2,11 +2,9 @@
 """
 修复 .git 的松散引用层（refs-doctor）
 
-问题背景
---------
-本仓库环境存在一个 Git 行为异常：`git fetch` / `git push` 完成后，
-`.git/refs/remotes/` 下的松散引用目录会被清空，且**不再重建**。
-后果：
+症状
+----
+`git fetch` 之后，远端分支"看起来丢了"：
 
     $ git fetch origin-ssh
        e12c0e1..0020b4e  main -> origin-ssh/main     # 报告更新了
@@ -15,29 +13,65 @@
     $ git status -sb
        ## main...origin-ssh/main [gone]              # 显示 branch 消失了
 
-根因
-----
-`rev-parse` 的 DWIM 缩写解析要求对应路径的**松散引用目录存在**，
-无法只靠 `packed-refs` 完成解析。目录被清空后它直接放弃查找，
-于是 `[gone]`。而 `git show-ref` / `git for-each-ref` 走另一条路径，
-仍能读到 `packed-refs`，所以症状表现得自相矛盾。
+根因：ref 迭代器的「目录级短路」
+--------------------------------
+Git 的引用数据库有两层存储：
 
-同时 `packed-refs` 里的值**也不会随 fetch/push 更新**，只有 reflog 是准的。
+    松散层  .git/refs/remotes/origin-ssh/main      （文件）
+    打包层  .git/packed-refs                       （文本，行 = "<sha> <refname>"）
+
+关键在于：**遍历引用时，目录发现只看文件系统**，`packed-refs` 里的条目
+不会产生对应的"虚拟目录"。
+
+于是当 `refs/remotes/origin-ssh/` 下**一个松散文件都没有**时：
+
+    refs/remotes              → 17 条   （父级能列出全部，含 origin-ssh 的 5 条）
+    refs/remotes/origin-ssh   →  0 条   （子级整棵子树被跳过）
+    rev-parse origin-ssh/main → fatal
+
+更隐蔽的是：只要该目录下**存在任意一个松散文件**，迭代器就**只迭代松散层**，
+`packed-refs` 中同目录的其他条目**继续不可见**：
+
+    （写入 origin-ssh/main 松散文件后）
+    refs/remotes/origin-ssh   →  1 条   （slim / test / toorigin / win 仍被吞掉）
+
+这解释了症状为何自相矛盾：
+`git show-ref <全限定名>` 走精确查找、能读 packed-refs；
+`git for-each-ref` 全量遍历走父级、也能列出；
+但带 pattern 的遍历与 `rev-parse` / `status` 走目录递归 → 全部失败。
+
+为什么只有本仓库中招
+--------------------
+本仓库三个远端目录的松散层与 packed 层**恰好完全同构**
+（origin 5/5、upstream 3/3、pr 4/4），从未触发短路；
+只有 `origin-ssh` 的松散文件会被 fetch 清空，松散数 0 ≠ packed 数 5，
+短路才显形。
+
+触发条件
+--------
+`git fetch` 完成后，`.git/refs/remotes/` 下的松散文件被清空且**不重建**
+（fetch 判定"值未变化 → 无需写引用事务"，但它显然做了清理）。
+
+不变量
+------
+`packed-refs` 的内容**始终是准确的**，fetch / push 都不会破坏它。
+唯一缺失的是宽松层文件。因此本脚本**不需要回写 packed-refs**，
+只需把松散层补齐到与 packed 层同构。
 
 权威值来源（优先级）
 --------------------
-1. `.git/logs/refs/remotes/<remote>/<branch>` 的**最后一行新值**（reflog 一直写盘正常）
+1. `.git/logs/refs/...` reflog 最后一行新值（reflog 一直写盘正常，且能反映最新 push）
 2. `packed-refs`（reflog 缺失时兜底）
 
 方案
 ----
-以 reflog 为准，重建 `refs/remotes/*` 与 `refs/heads/*` 的松散文件，
-并把最新值回写 `packed-refs`。幂等、无损。
+遍历 `packed-refs` 中 `refs/remotes/*` 与 `refs/heads/*` 的每一条，
+在松散层写出对应文件（值取 reflog 优先）。幂等、无损、不删任何东西。
 
 用法
 ----
-    python .git/hooks/refs-doctor.py            # 修复
-    python .git/hooks/refs-doctor.py --check    # 只检查（有问题退出码 1）
+    python tools/refs-doctor.py            # 修复
+    python tools/refs-doctor.py --check    # 只检查（有问题退出码 1）
 
     git refs-fix        # 同「修复」
     git fetch-checkout  # fetch + 自动修复
@@ -59,8 +93,9 @@ PACKED = os.path.join(GIT_DIR, "packed-refs")
 REFS = os.path.join(GIT_DIR, "refs")
 LOGS = os.path.join(GIT_DIR, "logs")
 
+# 需要保证"松散层与 packed 层同构"的命名空间
+SCOPES = ("refs/remotes/", "refs/heads/")
 
-# ---------------------------------------------------------------- packed-refs
 
 def load_packed() -> dict[str, str]:
     """读取 packed-refs → {refname: sha}"""
@@ -77,17 +112,6 @@ def load_packed() -> dict[str, str]:
                 out[parts[1].strip()] = parts[0].strip()
     return out
 
-
-def write_packed(refs: dict[str, str]) -> None:
-    """按 Git 的路径语义排序后写回 packed-refs"""
-    ordered = sorted(refs.items(), key=lambda kv: kv[0].split("/"))
-    buf = "# pack-refs with: peeled fully-peeled sorted\n"
-    buf += "".join("%s %s\n" % (sha, ref) for ref, sha in ordered)
-    with io.open(PACKED, "w", encoding="utf-8", newline="") as fh:
-        fh.write(buf)
-
-
-# ------------------------------------------------------------------- reflog
 
 def reflog_tip(refname: str) -> str | None:
     """从 reflog 最后一行取出新值（第 2 个字段）。
@@ -116,28 +140,18 @@ def reflog_tip(refname: str) -> str | None:
     return sha
 
 
-# ---------------------------------------------------------------- core logic
+def desired() -> dict[str, str]:
+    """松散层应当存在的引用 → 最新值（reflog 优先于 packed-refs）"""
+    wanted = {ref: sha for ref, sha in load_packed().items()
+              if ref.startswith(SCOPES)}
 
-def want_refs() -> dict[str, str]:
-    """汇总所有期望的引用及其最新值（reflog 优先于 packed-refs）"""
-    packed = load_packed()
-    wanted: dict[str, str] = {}
-
-    for ref, sha in packed.items():
-        if ref.startswith(("refs/remotes/", "refs/heads/")):
-            wanted[ref] = sha
-        else:
-            wanted[ref] = sha          # tags / stash 原样保留
-
-    # reflog 覆盖（仅对 heads / remotes 有意义）
+    # reflog 覆盖（能反映最新的 push，比 packed-refs 新）
     for ref in list(wanted):
-        if not ref.startswith(("refs/remotes/", "refs/heads/")):
-            continue
         tip = reflog_tip(ref)
         if tip:
             wanted[ref] = tip
 
-    # reflog 里有、packed-refs 里没有的引用（新建分支）
+    # reflog 里有、packed-refs 里没有的引用（例如新建但尚未 pack 的分支）
     for scope in ("refs/remotes", "refs/heads"):
         base = os.path.join(LOGS, scope.replace("/", os.sep))
         if not os.path.isdir(base):
@@ -148,7 +162,7 @@ def want_refs() -> dict[str, str]:
                     continue
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, LOGS).replace(os.sep, "/")
-                ref = "refs/" + rel if not rel.startswith("refs/") else rel
+                ref = rel if rel.startswith("refs/") else "refs/" + rel
                 tip = reflog_tip(ref)
                 if tip:
                     wanted[ref] = tip
@@ -160,15 +174,11 @@ def ref_path(refname: str) -> str:
     return os.path.join(REFS, refname[len("refs/"):].replace("/", os.sep))
 
 
-def repair(check_only: bool = False) -> int:
-    wanted = want_refs()
-    target = {r: s for r, s in wanted.items()
-              if r.startswith(("refs/remotes/", "refs/heads/"))}
-
+def _survey(wanted: dict[str, str]) -> tuple[list[str], list[str]]:
+    """返回 (missing, stale)"""
     missing: list[str] = []
     stale: list[str] = []
-
-    for ref, sha in sorted(target.items()):
+    for ref, sha in sorted(wanted.items()):
         path = ref_path(ref)
         if not os.path.isfile(path):
             missing.append(ref)
@@ -176,23 +186,25 @@ def repair(check_only: bool = False) -> int:
             with io.open(path, encoding="utf-8") as fh:
                 if fh.read().strip() != sha:
                     stale.append(ref)
+    return missing, stale
 
-    packed_drift = [r for r, s in target.items()
-                    if load_packed().get(r) not in (None, s)]
+
+def repair(check_only: bool = False) -> int:
+    wanted = desired()
+    missing, stale = _survey(wanted)
 
     if check_only:
-        bad = missing or stale or packed_drift
-        if bad:
-            print("[refs-doctor] 引用层异常：缺失 %d / 过期 %d / packed 漂移 %d"
-                  % (len(missing), len(stale), len(packed_drift)))
+        if missing or stale:
+            print("[refs-doctor] 松散引用层不完整：缺失 %d / 过期 %d"
+                  % (len(missing), len(stale)))
             for r in missing:
                 print("  缺失  %s" % r)
             for r in stale:
                 print("  过期  %s" % r)
-            for r in packed_drift:
-                print("  漂移  %s" % r)
+            print("  修复：git refs-fix")
             return 1
-        print("[refs-doctor] 正常：%d 条引用齐全且与 reflog 一致" % len(target))
+        print("[refs-doctor] 正常：%d 条松散引用与 reflog / packed-refs 一致"
+              % len(wanted))
         return 0
 
     fixed = 0
@@ -203,15 +215,8 @@ def repair(check_only: bool = False) -> int:
             fh.write(wanted[ref] + "\n")
         fixed += 1
 
-    if packed_drift:
-        merged = load_packed()
-        for ref in packed_drift:
-            merged[ref] = wanted[ref]
-        write_packed(merged)
-
-    if fixed or packed_drift:
-        print("[refs-doctor] 已修复：重建松散 %d 条，回写 packed %d 条"
-              % (fixed, len(packed_drift)))
+    if fixed:
+        print("[refs-doctor] 已修复：重建松散引用 %d 条" % fixed)
     return 0
 
 
