@@ -48,7 +48,9 @@ async function fetchWithTimeout(
 ): Promise<Response> {
   const { signal, clear } = withTimeout(init.signal ?? undefined, timeoutMs);
   try {
-    return await fetchWithTimeout(url, { ...init, signal });
+    // 注意：这里必须调用原生 fetch。曾误写成 fetchWithTimeout(...) 造成自递归，
+    // 抛 RangeError: Maximum call stack size exceeded，导致所有后端请求全部失败。
+    return await fetch(url, { ...init, signal });
   } finally {
     clear();
   }

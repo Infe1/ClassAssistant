@@ -183,6 +183,31 @@ cd app-ui && npx tsc --noEmit
 
 ---
 
+## 六之二、⚠️ 本次改动引入的严重缺陷（已于 2.0.4 修复）
+
+**`app-ui/src/services/api.ts` 的 `fetchWithTimeout` 被误写成调用自身**：
+
+```typescript
+return await fetchWithTimeout(url, { ...init, signal });   // 应为原生 fetch
+```
+
+造成 `RangeError: Maximum call stack size exceeded`，
+**全部 24 处后端请求失效，应用整体不可用**。
+
+| 项 | 内容 |
+|---|---|
+| 引入版本 | **2.0.3**（本次提交 `daac50e`） |
+| 修复版本 | **2.0.4** |
+| 为何 `npx tsc --noEmit` 未发现 | 自递归调用的类型签名完全匹配，编译器无从报错 |
+
+> **教训**：上面第五节把「`tsc --noEmit` EXIT=0」列为验证手段，
+> 但该缺陷恰恰逃过了类型检查。**静态检查通过 ≠ 改动安全**。
+> 涉及函数包装/代理时，必须人工确认内部调用的是目标函数而非自身。
+
+详见 [`前端请求栈溢出-排查与修复.md`](./前端请求栈溢出-排查与修复.md)。
+
+---
+
 ## 七、回滚
 
 四处改动互相独立，各自可单独回退：
