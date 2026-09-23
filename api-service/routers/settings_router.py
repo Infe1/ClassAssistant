@@ -43,6 +43,11 @@ async def update_settings(request: SettingsUpdateRequest):
             f.write(request.content.rstrip() + "\n")
 
         load_dotenv(ENV_PATH, override=True)
-        return {"status": "success", "message": "设置已保存并已同步到当前进程。"}
+        # LLM 相关配置（模型 / 密钥 / 超时）在下次调用时会按签名自动重建客户端，
+        # 无需重启；只有监听端口 API_PORT 必须重启进程才能变更。
+        return {
+            "status": "success",
+            "message": "设置已保存并已同步到当前进程（API_PORT 变更需重启应用生效）。",
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"保存设置失败: {exc}")

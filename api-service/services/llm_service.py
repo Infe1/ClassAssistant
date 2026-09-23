@@ -93,21 +93,50 @@ class LLMService:
     """大语言模型调用服务 - 兼容 OpenAI API"""
 
     def __init__(self):
-        # 从环境变量读取配置
-        self.base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        self.api_key = os.getenv("LLM_API_KEY", "")
-        self.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        # 说明：本类不缓存"构造时的配置"，而是每次访问 client 时比对配置签名，
+        # 有变化才重建 —— 这样设置面板保存的 LLM_* 配置无需重启后端即可生效。
+        # 此前是一次性读取并构造，导致改 key / 换模型 / 调 LLM_TIMEOUT 都必须重启。
+        self._client: AsyncOpenAI | None = None
+        self._signature: tuple | None = None
+        self._ensure_client()
+        self.prompt_service = PromptService()
 
-        # 初始化异步客户端
-        # timeout: 收窄 SDK 默认的 600 秒；max_retries=0 让我们自己控制重试次数，
-        # 避免「超时 → 内置重试 → 再等一个超时」把卡顿放大数倍。
-        self.client = AsyncOpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            timeout=resolve_llm_timeout(),
+    def _current_signature(self) -> tuple:
+        """当前 LLM 相关配置的签名（任一项变化都需要重建客户端）。"""
+        return (
+            os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+            os.getenv("LLM_API_KEY", ""),
+            os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            resolve_llm_timeout(),
+        )
+
+    def _ensure_client(self) -> None:
+        """配置变化时重建 AsyncOpenAI 客户端；无变化则直接复用。
+
+        timeout: 收窄 SDK 默认的 600 秒；max_retries=0 让我们自己控制重试次数，
+        避免「超时 → 内置重试 → 再等一个超时」把卡顿放大数倍。
+        """
+        signature = self._current_signature()
+        if signature == self._signature and self._client is not None:
+            return
+
+        base_url, api_key, model, timeout = signature
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self._client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
             max_retries=0,
         )
-        self.prompt_service = PromptService()
+        self._signature = signature
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """当前客户端；配置发生变化时自动重建（无需重启进程）。"""
+        self._ensure_client()
+        return self._client
 
     # ------------------------------------------------------------------
     # 调用入口：统一记录 prompt 缓存命中情况
