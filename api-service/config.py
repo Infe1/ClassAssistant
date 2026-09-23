@@ -11,7 +11,7 @@ from datetime import datetime
 # 应用版本号。
 # 后端没有像前端 app-ui/package.json 那样的构建期单一来源，此处手工维护；
 # 改版本号时需与 app-ui/package.json 保持一致（发布前核对）。
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 
 if getattr(sys, 'frozen', False):
     # PyInstaller 打包模式：exe 位于 release/backend/，data 在 release/data/
