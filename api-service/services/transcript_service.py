@@ -43,13 +43,22 @@ class TranscriptService:
         if not lines:
             return ""
 
+        # 只统计「最后一次会话」的内容：以最后一个「课堂记录 开始于」标记为界。
+        # 原因（对应审查报告 B4）：转录行时间戳只有 HH:MM:SS、不含日期，
+        # 若转录文件里残留着上一节课的记录，其同时间段的行会被误判为
+        # 「最近 N 分钟」，混入救场 / 进度总结的上下文。
+        session_start_index = 0
+        for idx, raw_line in enumerate(lines):
+            if raw_line.strip().startswith("=== 课堂记录 开始于"):
+                session_start_index = idx
+
         # 解析带有时间戳的行，筛选最近 N 分钟的内容
         now = datetime.now()
         cutoff = now - timedelta(minutes=minutes)
         recent_lines = []
         in_summary_block = False
 
-        for line in lines:
+        for line in lines[session_start_index:]:
             line = line.strip()
             if not line or line.startswith("==="):
                 if line == self.SUMMARY_START_MARKER:
