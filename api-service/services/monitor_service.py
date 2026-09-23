@@ -73,6 +73,9 @@ class MonitorService:
         self._recent_normalized_entries: List[str] = []
         self._rolling_summary: str = ""
         self._summary_source_entries: List[tuple[str, str]] = []
+        # 上一次成功落盘的完整文本。用于把「纯追加」识别出来，
+        # 走 append 而不是整文件重写（见 _flush_transcript_file）。
+        self._flushed_text: str | None = None
         self._summary_task_running: bool = False
 
         # ASR 增量文本追踪
@@ -432,6 +435,18 @@ class MonitorService:
         return True
 
     def _flush_transcript_file(self):
+        """把内存态落盘。
+
+        性能说明（对应审查报告 C1）：
+        此前每条新行都全量重写整个文件 —— 2 小时课程约 1500 行时总写入量约为
+        行数的平方，且发生在 ASR 回调的锁内。
+
+        现在增加增量判断：若本次内容**以上次落盘内容为前缀**（即仅在末尾追加了
+        若干行），只 append 差量；否则（会话开始/结束标记、滚动摘要更新、行被
+        合并或删除、首次落盘）仍走全量重写。
+
+        两条路径产出的文件内容完全一致，追加路径只是省掉重复 IO。
+        """
         lines: List[str] = [self._session_start_marker, ""]
 
         if self._course_name:
@@ -455,9 +470,19 @@ class MonitorService:
         if self._session_end_marker:
             lines.extend(["", self._session_end_marker])
 
+        body = "\n".join(lines).rstrip() + "\n"
+        previous = self._flushed_text
+
         try:
-            with open(self.transcript_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines).rstrip() + "\n")
+            if previous is not None and body.startswith(previous):
+                # 纯追加：只写新增的那部分
+                with open(self.transcript_path, "a", encoding="utf-8") as f:
+                    f.write(body[len(previous):])
+            else:
+                # 头部变化 / 内容被改写 / 首次落盘：整文件重写
+                with open(self.transcript_path, "w", encoding="utf-8") as f:
+                    f.write(body)
+            self._flushed_text = body
         except Exception:
             logger.exception("写入转录文件失败")
 
