@@ -8,13 +8,24 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from services.ppt_service import parse_material
 import os
 import re
+import tempfile
 from datetime import datetime
 from config import DATA_DIR, CITE_DIR
 
 router = APIRouter()
 
-# 支持的文件扩展名
-ALLOWED_EXTENSIONS = ('.pptx', '.ppt', '.pdf', '.docx', '.doc')
+# 支持的文件扩展名。
+# 注意：.ppt / .doc（Office 2003 二进制老格式）**不在其中** ——
+# python-pptx / python-docx 只支持 OOXML（.pptx / .docx），
+# 把它们列入白名单会让用户误以为可上传，实际必然在打开阶段失败。
+ALLOWED_EXTENSIONS = ('.pptx', '.pdf', '.docx')
+
+# 老格式：单独识别并给出转换引导，而不是抛笼统的"解析失败"
+LEGACY_EXTENSIONS = ('.ppt', '.doc')
+LEGACY_HINT = (
+    "不支持 {ext} 格式（Office 2003 老格式）。"
+    "请先用 Office / WPS 打开并「另存为」.pptx 或 .docx，再上传。"
+)
 
 
 def _build_safe_stem(filename: str) -> str:
@@ -32,18 +43,23 @@ async def upload_ppt(file: UploadFile = File(...)):
     filename = file.filename or ""
     ext = os.path.splitext(filename)[1].lower()
 
+    # 老格式单独提示，避免用户拿到一句没有引导的「解析失败」
+    if ext in LEGACY_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=LEGACY_HINT.format(ext=ext))
+
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail=f"不支持的文件格式，仅支持: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    try:
-        content = await file.read()
+    content = await file.read()
 
-        # 使用安全文件名保存临时文件
-        temp_path = os.path.join(DATA_DIR, f"temp_upload{ext}")
-        with open(temp_path, "wb") as f:
+    # 临时文件改用 mkstemp：每次生成唯一文件名，
+    # 避免两个并发上传（或前端重试）写入同一路径互相覆盖。
+    fd, temp_path = tempfile.mkstemp(suffix=ext, dir=DATA_DIR)
+    try:
+        with os.fdopen(fd, "wb") as f:
             f.write(content)
 
         # 调用统一解析服务
@@ -57,10 +73,6 @@ async def upload_ppt(file: UploadFile = File(...)):
         with open(material_path, "w", encoding="utf-8") as f:
             f.write(text)
 
-        # 清理临时文件
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
         return {
             "status": "success",
             "message": f"成功解析并保存到 cite: {cite_filename}",
@@ -70,3 +82,10 @@ async def upload_ppt(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件解析失败: {str(e)}")
+    finally:
+        # 成功与失败路径都清理临时文件（此前失败会残留 data/temp_upload.*）
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
