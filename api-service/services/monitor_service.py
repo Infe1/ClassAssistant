@@ -412,6 +412,11 @@ class MonitorService:
                     return True
 
             if shorter_len >= 6:
+                # 长度差过大时无需精确比对（对应审查报告 C2）：
+                # ratio() 的上界是 2*s/(s+l)，令其 < 0.88 解得 s/l < 0.786，
+                # 因此比值低于 0.78 时必然达不到阈值，跳过 O(n·m) 的比对。
+                if shorter_len / longer_len < 0.78:
+                    continue
                 similarity = SequenceMatcher(None, dedupe_text, recent).ratio()
                 if similarity >= 0.88:
                     return True
