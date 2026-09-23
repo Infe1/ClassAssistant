@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import os
 import sys
 
+# 导入 config 会顺带创建 data / cite / summaries 目录（模块级副作用）
+from config import APP_VERSION, DATA_DIR
+
 # 加载环境变量 —— 明确指定 .env 路径，避免打包版加载到开发目录的 .env
 if getattr(sys, 'frozen', False):
     _dotenv_path = os.path.join(os.path.dirname(sys.executable), '.env')
@@ -18,10 +21,11 @@ else:
 load_dotenv(_dotenv_path)
 
 # 创建 FastAPI 应用实例
+# 版本号统一取自 config.APP_VERSION —— 此前硬编码 "1.0.1"，与 package.json 长期脱节
 app = FastAPI(
     title="上课摸鱼搭子 - 后端服务",
     description="大学课堂辅助工具的后端 API 服务",
-    version="1.0.1"
+    version=APP_VERSION
 )
 
 # 配置 CORS，允许 Tauri 前端访问
@@ -32,9 +36,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 确保 data 目录存在（由 config.py 自动创建）
-from config import DATA_DIR
 
 # ---- 注册路由 (后续步骤中实现) ----
 from routers import ppt_router, monitor_router, rescue_router, summary_router, settings_router, prompt_router

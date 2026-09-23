@@ -28,7 +28,7 @@
 ## 📌 关于本项目
 
 本仓库是基于上游 [ouyangyipeng/ClassAssistant](https://github.com/ouyangyipeng/ClassAssistant)
-**持续维护的分支**，当前版本 **v2.0.3**。
+**持续维护的分支**，当前版本 **v2.0.4**。
 
 > **本项目与上游的方向已经出现明显区别。**
 > 上游以「功能面的横向铺开」为主；本分支的重心转向

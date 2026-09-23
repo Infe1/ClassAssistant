@@ -33,12 +33,6 @@ struct BackendBootstrapResult {
     message: String,
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 fn build_bootstrap_result(status: &str, message: impl Into<String>) -> BackendBootstrapResult {
     BackendBootstrapResult {
         status: status.to_string(),
@@ -245,7 +239,6 @@ fn cleanup_backend_processes(_graceful_stop: bool) {}
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
         .setup(|app| {
             let app_handle = app.handle().clone();
 
